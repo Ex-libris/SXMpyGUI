@@ -390,7 +390,6 @@ class DDEClient(object):
         return self.GetPara(TopicItem)  # Retrieve the parameter value
 
 
-
 class MyMsgClass (threading.Thread):
     """
         A threading
