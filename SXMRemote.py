@@ -26,7 +26,7 @@ import time
 from win32 import win32event #manu 
 from ctypes import POINTER, WINFUNCTYPE, c_char_p, c_void_p, c_int, c_ulong, c_char_p
 from ctypes.wintypes import BOOL, DWORD, BYTE, INT, LPCWSTR, UINT, ULONG
-
+from ctypes import byref, create_string_buffer
 import configparser
 
 # DECLARE_HANDLE(name) typedef void *name;
@@ -148,240 +148,246 @@ class DDEError(RuntimeError):
         else:
             RuntimeError.__init__(self, "%s (err=%s)" % (msg, hex(DDE.GetLastError(idInst))))
 
-class DDEClient(object): #'self.' in whole class 
+class DDEClient(object):
     """The DDEClient class.
 
-    Use this class to create and manage a connection to a service/topic.  To get
-    classbacks subclass DDEClient and overwrite callback."""
+    This class is used to create and manage a connection to a DDE (Dynamic Data Exchange) 
+    service/topic. To handle callbacks, subclass DDEClient and override the callback method.
+    """
 
     def __init__(self, service, topic):
-        """Create a connection to a service/topic."""
+        """
+        Initialize a connection to a DDE service/topic.
+
+        Args:
+            service (str): The name of the DDE service to connect to.
+            topic (str): The topic within the DDE service to connect to.
+        """
         from ctypes import byref
 
-        self._idInst = DWORD(0)
-        self._hConv = HCONV()
+        # Initialize instance variables
+        self._idInst = DWORD(0)  # DDE instance identifier
+        self._hConv = HCONV()    # Handle to the DDE conversation
 
+        # Set up the callback function for DDE events
         self._callback = DDECALLBACK(self._callback)
+
+        # Initialize the DDEML (Dynamic Data Exchange Management Library)
         res = DDE.Initialize(byref(self._idInst), self._callback, 0x00000010, 0)
         if res != DMLERR_NO_ERROR:
-            raise DDEError("Unable to register with DDEML (err=%s)" % hex(res))
+            raise DDEError(f"Unable to register with DDEML (err={hex(res)})")
 
+        # Create string handles for the service and topic
         hszService = DDE.CreateStringHandle(self._idInst, service, 1200)
         hszTopic = DDE.CreateStringHandle(self._idInst, topic, 1200)
+
+        # Establish a conversation with the DDE server
         self._hConv = DDE.Connect(self._idInst, hszService, hszTopic, PCONVCONTEXT())
+        
+        # Free the string handles after use
         DDE.FreeStringHandle(self._idInst, hszTopic)
         DDE.FreeStringHandle(self._idInst, hszService)
+
+        # Raise an error if the conversation could not be established
         if not self._hConv:
             raise DDEError("Unable to establish a conversation with server", self._idInst)
 
-        self.advise("Scan");
-        self.advise('Command');
-        self.advise('SaveFileName');
-        self.advise('ScanLine');
-        self.advise('MicState');
-        self.advise('SpectSave');
-        
-        self.config=configparser.ConfigParser() #instantiate
-        self.NotGotAnswer = False;
-        self.LastAnswer = "";
+        # Set up advisory links for specific topics
+        self.advise("Scan")
+        self.advise("Command")
+        self.advise("SaveFileName")
+        self.advise("ScanLine")
+        self.advise("MicState")
+        self.advise("SpectSave")
+
+        # Initialize configuration parser
+        self.config = configparser.ConfigParser()
+
+        # Initialize variables for tracking responses
+        self.NotGotAnswer = False  # Flag to indicate if an answer was received
+        self.LastAnswer = ""       # Stores the last received answer
 
         
     def __del__(self):
         """Cleanup any active connections."""
         if self._hConv:
-            DDE.Disconnect(self._hConv)
+            DDE.Disconnect(self._hConv)  # Disconnect from the DDE conversation
         if self._idInst:
-            DDE.Uninitialize(self._idInst)
+            DDE.Uninitialize(self._idInst)  # Uninitialize the DDE instance
 
     def advise(self, item, stop=False):
         """Request updates when DDE data changes."""
-        from ctypes import byref
 
-        hszItem = DDE.CreateStringHandle(self._idInst, item, 1200)
-        hDdeData = DDE.ClientTransaction(LPBYTE(), 0, self._hConv, hszItem, CF_TEXT, XTYP_ADVSTOP if stop else XTYP_ADVSTART, TIMEOUT_ASYNC, LPDWORD())
-        DDE.FreeStringHandle(self._idInst, hszItem)
+        hszItem = DDE.CreateStringHandle(self._idInst, item, 1200)  # Create a string handle for the item
+        hDdeData = DDE.ClientTransaction(LPBYTE(), 0, self._hConv, hszItem, CF_TEXT, 
+                                         XTYP_ADVSTOP if stop else XTYP_ADVSTART, TIMEOUT_ASYNC, LPDWORD())
+        DDE.FreeStringHandle(self._idInst, hszItem)  # Free the string handle after use
         if not hDdeData:
             raise DDEError("Unable to %s advise" % ("stop" if stop else "start"), self._idInst)
-        DDE.FreeDataHandle(hDdeData)
+        DDE.FreeDataHandle(hDdeData)  # Free the data handle
 
     def execute(self, command, timeout=5000):
         """Execute a DDE command."""
-        self.NotGotAnswer=True
-        # Dec. 16 we need utf16 without heater!
-        command='begin\r\n  '+command+'\r\nend.\r\n';#create pascal style program
-        #print(command)
-        command=bytes(command, 'utf-16');     #falk
-        command=command.strip(b"\xff")        #falk
-        command=command.strip(b"\xfe")        #falk
+        self.NotGotAnswer = True  # Flag to indicate if an answer was received
+        command = f'begin\r\n  {command}\r\nend.\r\n'  # Create a Pascal-style program
+        command = bytes(command, 'utf-16').strip(b"\xff").strip(b"\xfe")  # Convert to bytes and clean up
         pData = c_char_p(command)
         cbData = DWORD(len(command) + 1)
-        #hDdeData = DDE.ClientTransaction(pData, cbData, self._hConv, HSZ(), CF_UNICODETEXT, XTYP_EXECUTE, timeout, LPDWORD())
-        # need utf-16 and fmt is ignored? Nov. 16 why?		
         hDdeData = DDE.ClientTransaction(pData, cbData, self._hConv, HSZ(), CF_TEXT, XTYP_EXECUTE, timeout, LPDWORD())
         if not hDdeData:
             raise DDEError("Unable to send command", self._idInst)
-        DDE.FreeDataHandle(hDdeData)
+        DDE.FreeDataHandle(hDdeData)  # Free the data handle
 
     def request(self, item, timeout=5000):
         """Request data from DDE service."""
-        from ctypes import byref
 
-        hszItem = DDE.CreateStringHandle(self._idInst, item, 1200)
+        hszItem = DDE.CreateStringHandle(self._idInst, item, 1200)  # Create a string handle for the item
         hDdeData = DDE.ClientTransaction(LPBYTE(), 0, self._hConv, hszItem, CF_TEXT, XTYP_REQUEST, timeout, LPDWORD())
-        DDE.FreeStringHandle(self._idInst, hszItem)
+        DDE.FreeStringHandle(self._idInst, hszItem)  # Free the string handle after use
         if not hDdeData:
             raise DDEError("Unable to request item", self._idInst)
 
         if timeout != TIMEOUT_ASYNC:
             pdwSize = DWORD(0)
-            pData = DDE.AccessData(hDdeData, byref(pdwSize))
+            pData = DDE.AccessData(hDdeData, byref(pdwSize))  # Access the data
             if not pData:
                 DDE.FreeDataHandle(hDdeData)
                 raise DDEError("Unable to access data", self._idInst)
-            # TODO: use pdwSize
-            DDE.UnaccessData(hDdeData)
+            DDE.UnaccessData(hDdeData)  # Unaccess the data
         else:
             pData = None
-        DDE.FreeDataHandle(hDdeData)
-        return pData
+        DDE.FreeDataHandle(hDdeData)  # Free the data handle
+        return pData  # Return the requested data
 
     def callback(self, value, item=None):
         """Callback function for advice."""
-        #print ("callback %s: %s" % (item, value))
-
-        #value = str(value, 'utf-8') #Feb. 17
-        #value = value.strip('\r\n') #Feb. 17
-
-        self.LastAnswer = value;
-        if (value.startswith(b'Scan on')):
+        self.LastAnswer = value  # Store the last answer received
+        if value.startswith(b'Scan on'):
             self.LastAnswer = 1
-            self.ScanOnCallBack ();     # print('on')
-            return
-        elif (value.startswith(b'Scan off')):
+            self.ScanOnCallBack()  # Handle scan on callback
+        elif value.startswith(b'Scan off'):
             self.LastAnswer = 0
-            self.ScanOffCallBack();     # print('off')
-            return
-        elif (item.startswith(b'SaveFileName')):
-            FileName=str(value,'utf-8').strip('\r\n')
-            self.SaveIsDone(FileName);  # print('SaveIsDone')
-            return
-        elif (item.startswith(b'ScanLine')):
+            self.ScanOffCallBack()  # Handle scan off callback
+        elif item.startswith(b'SaveFileName'):
+            FileName = str(value, 'utf-8').strip('\r\n')
+            self.SaveIsDone(FileName)  # Handle save completion
+        elif item.startswith(b'ScanLine'):
             value = str(value, 'utf-8').strip('\r\n')
-            self.Scan(value);           # print('ScanLine')
-            return
-        elif (item.startswith(b'MicState')):
-            self.MicState(value);
-            return
-        elif (item.startswith(b'SpectSave')):
-            self.SpectSave(value);
-            return
-        elif (item.startswith(b'Command')): # echo of command
-            self.LastAnswer = value;
-            return
-    
+            self.Scan(value)  # Handle scan line
+        elif item.startswith(b'MicState'):
+            self.MicState(value)  # Handle microphone state
+        elif item.startswith(b'SpectSave'):
+            self.SpectSave(value)  # Handle spectrum save
+        elif item.startswith(b'Command'):
+            self.LastAnswer = value  # Echo of command
         else:
-            print ("Unknown callback %s: %s" % (item, value))
-        
-    
+            print("Unknown callback %s: %s" % (item, value))  # Handle unknown callback
+
     def _callback(self, wType, uFmt, hConv, hsz1, hsz2, hDdeData, dwData1, dwData2):
+        """Handle DDE callback events."""
         if wType == XTYP_XACT_COMPLETE:
-            pass #print('XTYP_XACT_COMPLETE');
+            pass  # Transaction complete
         elif wType == XTYP_DISCONNECT:
-            print('disconnect');
+            print('disconnect')  # Handle disconnection
         elif wType == XTYP_ADVDATA:
-            from ctypes import byref, create_string_buffer
 
             dwSize = DWORD(0)
-            pData = DDE.AccessData(hDdeData, byref(dwSize))
+            pData = DDE.AccessData(hDdeData, byref(dwSize))  # Access the data
             if pData:
-                #falk item = create_string_buffer( '\000' * 128)
-                item = create_string_buffer(128)
-                DDE.QueryString(self._idInst, hsz2, item, 128, 1004)
-                self.callback(pData, item.value)
-                self.NotGotAnswer = False;
-                DDE.UnaccessData(hDdeData)
-                #print("set false");
-            return DDE_FACK
+                item = create_string_buffer(128)  # Create a buffer for the item
+                DDE.QueryString(self._idInst, hsz2, item, 128, 1004)  # Query the item string
+                self.callback(pData, item.value)  # Call the callback function
+                self.NotGotAnswer = False  # Reset the answer flag
+                DDE.UnaccessData(hDdeData)  # Unaccess the data
+            return DDE_FACK  # Acknowledge the data
         else:
-            print('callback'+hex(wType));
+            print('callback' + hex(wType))  # Handle other callback types
 
-        return 0
-    
-    def ScanOnCallBack (self):
-        print('scan is on');
+        return 0  # Default return value
 
-    def ScanOffCallBack (self) :
-        print('scan is off');
-    
-    def SaveIsDone (self, FileName) :
-        print(FileName);
-        
-    def Scan (self, LineNr) :
-        pass  #print(LineNr); # 1st letter is u/d/f/b for up/down/forward/backward
+    def ScanOnCallBack(self):
+        """Handle scan on callback."""
+        print('scan is on')
 
-    def MicState (self, Value) :
-        print ('MicState '+ str(Value))
+    def ScanOffCallBack(self):
+        """Handle scan off callback."""
+        print('scan is off')
 
-    def SpectSave (self, Value) :
-        print ('SpectSave '+ str(Value))
-        #print (str(Value))
-    
-    def StartMsgLoop (self):
+    def SaveIsDone(self, FileName):
+        """Handle completion of save operation."""
+        print(FileName)
+
+    def Scan(self, LineNr):
+        """Handle scanning operation."""
+        pass  # Placeholder for scan logic
+
+    def MicState(self, Value):
+        """Handle microphone state updates."""
+        print('MicState ' + str(Value))
+
+    def SpectSave(self, Value):
+        """Handle spectrum save updates."""
+        print('SpectSave ' + str(Value))
+
+    def StartMsgLoop(self):
+        """Start the message loop in a separate thread."""
         MsgLoop = MyMsgClass()
         MsgLoop.start()
 
-    def GetIniEntry (self, section, item):
-        #get current iniFile
-        IniName=self.request('IniFileName');
-        IniName=str(IniName,'utf-8')
-        IniName=IniName.strip('\r\n')
-        #config=configparser.ConfigParser() #instantiate
-        self.config.read(IniName)
-        val=self.config.get(section, item)
+    def GetIniEntry(self, section, item):
+        """Retrieve a value from the INI configuration file."""
+        IniName = self.request('IniFileName')  # Get the current INI file name
+        IniName = str(IniName, 'utf-8').strip('\r\n')  # Convert to string and clean up
+        self.config.read(IniName)  # Read the INI file
+        val = self.config.get(section, item)  # Get the value from the specified section and item
         return val
 
-    def GetChannel (self, ch):
-        string="a:=GetChannel("+str(ch)+");\r\n  writeln(a);"
-        self.execute(string, 1000);
+    def GetChannel(self, ch):
+        """Get the value of a specific channel."""
+        string = f"a:=GetChannel({ch});\r\n  writeln(a);"  # Create the command string
+        self.execute(string, 1000)  # Execute the command
 
         while self.NotGotAnswer:
-            loop();
+            loop()  # Wait for the answer
 
-        BackStr=self.LastAnswer;
-        BackStr=str(BackStr,'utf-8').split('\r\n')
-        if len(BackStr)>=2:
-            NrStr=BackStr[1].replace(',','.')
-            val=float(NrStr)
-            return val
-        return
+        BackStr = self.LastAnswer  # Get the last answer
+        BackStr = str(BackStr, 'utf-8').split('\r\n')  # Convert to string and split
+        if len(BackStr) >= 2:
+            NrStr = BackStr[1].replace(',', '.')  # Replace comma with dot
+            val = float(NrStr)  # Convert to float
+            return val  # Return the value
+        return None  # Return None if no valid value
 
     def SendWait(self, command):
-        self.execute(command, 1000);
+        """Send a command and wait for a response."""
+        self.execute(command, 1000)  # Execute the command
         while self.NotGotAnswer:
-            loop();
+            loop()  # Wait for the answer
 
-
-    def GetPara (self, TopicItem):
-        self.execute(TopicItem, 1000);
+    def GetPara(self, TopicItem):
+        """Get a parameter value from the DDE service."""
+        self.execute(TopicItem, 1000)  # Execute the command
 
         while self.NotGotAnswer:
-            loop();
+            loop()  # Wait for the answer
 
-        BackStr=self.LastAnswer;
-        BackStr=str(BackStr,'utf-8').split('\r\n')
-        if len(BackStr)>=2:
-            NrStr=BackStr[1].replace(',','.')
-            val=float(NrStr)
-            return val
-        return
+        BackStr = self.LastAnswer  # Get the last answer
+        BackStr = str(BackStr, 'utf-8').split('\r\n')  # Convert to string and split
+        if len(BackStr) >= 2:
+            NrStr = BackStr[1].replace(',', '.')  # Replace comma with dot
+            val = float(NrStr)  # Convert to float
+            return val  # Return the value
+        return None  # Return None if no valid value
 
-    def GetScanPara (self, item):
-        TopicItem="a:=GetScanPara('"+item+"');\r\n  writeln(a);"
-        return self.GetPara(TopicItem)
+    def GetScanPara(self, item):
+        """Get scan parameter value."""
+        TopicItem = f"a:=GetScanPara('{item}');\r\n  writeln(a);"
+        return self.GetPara(TopicItem)  # Retrieve the parameter value
 
-    def GetFeedbackPara (self, item):
-        TopicItem="a:=GetFeedPara('"+item+"');\r\n  writeln(a);"
-        return self.GetPara(TopicItem)
+    def GetFeedbackPara(self, item):
+        """Get feedback parameter value."""
+        TopicItem = f"a:=GetFeedPara('{item}');\r\n  writeln(a);"
+        return self.GetPara(TopicItem)  # Retrieve the parameter value
 
 
 
@@ -411,51 +417,19 @@ class MyMsgClass (threading.Thread):
             DispatchMessage(lpmsg)
             print ("loop")
 
-def loop():
-    from ctypes import POINTER, byref, c_ulong
-    from ctypes.wintypes import BOOL, HWND, MSG, UINT
 
+def loop():
     LPMSG = POINTER(MSG)
     LRESULT = c_ulong
     GetMessage = get_winfunc("user32", "GetMessageW", BOOL, (LPMSG, HWND, UINT, UINT))
     TranslateMessage = get_winfunc("user32", "TranslateMessage", BOOL, (LPMSG,))
-    # restype = LRESULT
     DispatchMessage = get_winfunc("user32", "DispatchMessageW", LRESULT, (LPMSG,))
 
     msg = MSG()
     lpmsg = byref(msg)
-    #print ("Start Msg loop")
     GetMessage(lpmsg, HWND(), 0, 0)
     TranslateMessage(lpmsg)
     DispatchMessage(lpmsg)
-    #print ("end loop")
 
-MySXM= SXMRemote.DDEClient("SXM","Remote");
+MySXM= SXMRemote.DDEClient("SXM","Remote");g)
 
-
-"""
-if __name__ == "__main__":
-    # Create a connection to ESOTS (OTS Swardfish) and to instrument MAR11 ALSI
-    dde = DDEClient("ESOTS", "MAR11 ALSI")
-
-    # Monitor the various attributes from MAR11 ALSI
-    dde.advise("BIDQ")    # Last bid quantity
-    dde.advise("BIDP")    # Last bid price
-    dde.advise("ASKP")    # Last ask price
-    dde.advise("ASKQ")    # Last ask quantity
-    dde.advise("LASTP")   # Last traded price
-    dde.advise("TIME")    # Last traded time
-    dde.advise("VOL")     # Daily volume
-
-    # Run the main message loop to receive advices
-    WinMSGLoop()
-"""
-
-
-"""
-    self.hWaitCommand=win32event.CreateEvent(None, 0,0, None);
-    win32event.SetEvent(self.hWaitCommand)
-    #win32event.ResetEvent(self.hWaitCommand)
-    #res=win32event.WaitForSingleObject(self.hWaitCommand, 10000)
-
-"""
