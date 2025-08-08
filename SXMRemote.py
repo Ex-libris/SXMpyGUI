@@ -430,5 +430,5 @@ def loop():
     TranslateMessage(lpmsg)
     DispatchMessage(lpmsg)
 
-MySXM= SXMRemote.DDEClient("SXM","Remote");g)
+MySXM= SXMRemote.DDEClient("SXM","Remote")
 
