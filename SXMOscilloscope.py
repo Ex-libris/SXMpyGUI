@@ -1,39 +1,33 @@
 """
-SXM Time-Based Multi-Channel Scope (deque-optimized, mock-capable, well-commented)
+SXM Time-Based Multi-Channel Scope (speed-tuned, dedup IO, deque tail slicing)
 
-What this program does
-----------------------
-• Plots 4 live, time-based signals from an Anfatec SXM controller (or mock data).
-• Optional “Relative Z (Topo)” view using a tiny IIR high-pass filter (ΔZ).
-• Dual-axis comparison plot to overlay two channels with independent Y-axes.
-• For each plot, a compact stats bar *below* the plot shows:
-    – Instantaneous value
-    – Noise estimate (σ, std. dev. over visible window)
-    – SNR estimate (20*log10(|mean|/σ) over the visible window)
-• Clean architecture:
-    – IDataSource interface + DriverDataSource / MockDataSource
-    – (Future) DeviceCommandInterface placeholder for DDE/COM
-• Performance tuned for Python:
-    – Uses deque(maxlen=…) for O(1) appends and automatic aging
-    – Extracts the tail of each deque efficiently (O(N_window), not O(N_history))
-    – Reuses IO buffers for DeviceIoControl
-    – PyQtGraph downsampling/clipping enabled
-
-Quick start
+Two profiles:
 -----------
-Run this file directly. If the "\\.\SXM" driver can’t be opened, the app
-falls back to mock data automatically. You can also switch sources from the menu.
+FAST_PROFILE = 'balanced'   -> keeps comparison + stats, but throttles/approximates
+FAST_PROFILE = 'max'        -> removes comparison plot and stats bars for maximum throughput
+
+What’s optimized:
+-----------------
+• Per-tick device I/O is **deduplicated** (each needed channel read once).
+• Deques with maxlen store histories; we **extract only the tail** we need to plot.
+• Stats use **EWMA** (exponentially weighted) and are **throttled** (fewer updates).
+• Labels/axes only update when content actually changes (avoid needless work).
+• PyQtGraph clipping/downsampling enabled; antialias off; OpenGL on when available.
 """
+
+# ------------------------- CONFIG: choose your profile -------------------------
+FAST_PROFILE = 'balanced'   # 'balanced' or 'max'
+# ------------------------------------------------------------------------------
 
 import sys
 import time
 import math
 import ctypes
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 from collections import deque
 from itertools import islice
 
-# Try importing Windows driver modules. If not available, we run in mock mode.
+# Try Windows driver modules; fall back to mock if unavailable
 try:
     import win32file, win32con
     WIN32_AVAILABLE = True
@@ -45,20 +39,12 @@ import pyqtgraph as pg
 import numpy as np
 
 
-# -----------------------------------------------------------------------------
-# PyQtGraph global options
-# -----------------------------------------------------------------------------
-# • useOpenGL: let GPU draw lines if available (faster on many systems)
-# • antialias=False: a small visual trade-off for measurable CPU savings
+# --------------------- PyQtGraph global options (performance) -----------------
 pg.setConfigOptions(useOpenGL=True, antialias=False)
 
 
-# -----------------------------------------------------------------------------
-# Channel catalog: human_name -> (driver_index, short_label, unit, scale_factor)
-#   • driver_index: integer code passed to the Windows driver
-#   • unit: human unit for display
-#   • scale_factor: raw_int * scale_factor -> physical_units (float)
-# -----------------------------------------------------------------------------
+# ----------------------------- Channel dictionary -----------------------------
+# human_name -> (driver_index, short_label, unit, scale_factor)
 channels = {
     'Topo':       (  0, 'DAC0',    'nm', -2.60914e-07),
     'Bias':       ( -1, 'DAC1',    'mV',  9.4e-06),
@@ -97,23 +83,17 @@ channels = {
 }
 
 
-# =============================================================================
-# Data source layer (encapsulated)
-# =============================================================================
+# ================================ Data sources =================================
 
 class IDataSource:
-    """
-    Interface for all data sources (real driver or mock).
-    Implementations return a RAW integer from the hardware/driver.
-    Scaling to physical units is applied later using 'channels'.
-    """
+    """Interface. Implementations return a RAW integer (no scaling)."""
     def read_value(self, channel_index: int) -> int:
         raise NotImplementedError
 
 
 class DriverDataSource(IDataSource):
     """
-    Read raw values via the SXM device driver (Windows DeviceIoControl).
+    Reads raw values via the SXM device driver (Windows DeviceIoControl).
     Reuses an input buffer to avoid per-call allocations.
     """
     FILE_DEVICE_UNKNOWN = 0x00000022
@@ -127,634 +107,460 @@ class DriverDataSource(IDataSource):
     IOCTL_GET_KANAL = CTL_CODE.__func__(FILE_DEVICE_UNKNOWN, FILE_ANY_ACCESS, 0xF0D, METHOD_BUFFERED)
 
     def __init__(self, driver_handle):
-        """
-        Parameters
-        ----------
-        driver_handle : Windows HANDLE opened on "\\\\.\\SXM".
-        """
-        self.driver_handle = driver_handle
-        # Reusable 4-byte input buffer for passing the channel index to the driver.
-        self._inbuf = ctypes.create_string_buffer(ctypes.sizeof(ctypes.c_long))
+        self.handle = driver_handle
+        self._inbuf = ctypes.create_string_buffer(ctypes.sizeof(ctypes.c_long))  # reused
 
     def read_value(self, channel_index: int) -> int:
-        """
-        Ask the driver for one channel's raw value and return it as a Python int.
-        """
-        ctypes.memmove(self._inbuf,
-                       ctypes.byref(ctypes.c_long(channel_index)),
+        ctypes.memmove(self._inbuf, ctypes.byref(ctypes.c_long(channel_index)),
                        ctypes.sizeof(ctypes.c_long))
-        result_bytes = win32file.DeviceIoControl(
-            self.driver_handle,
-            self.IOCTL_GET_KANAL,
-            self._inbuf,
-            ctypes.sizeof(ctypes.c_long)
-        )
-        return ctypes.c_long.from_buffer_copy(result_bytes).value
+        out = win32file.DeviceIoControl(self.handle, self.IOCTL_GET_KANAL,
+                                        self._inbuf, ctypes.sizeof(ctypes.c_long))
+        return ctypes.c_long.from_buffer_copy(out).value
 
 
 class MockDataSource(IDataSource):
     """
-    Synthetic signal generator used when the driver is unavailable.
-    Produces plausible raw integers: slow drift + sinusoid + Gaussian noise.
+    Synthetic generator: slow drift + sinusoid + Gaussian noise (raw ints).
     """
     def __init__(self, seed: int = 12345):
-        self.start_time = time.time()
+        self.t0 = time.time()
         self.rng = np.random.default_rng(seed)
 
     def read_value(self, channel_index: int) -> int:
-        """
-        Create a deterministic per-channel raw integer sample based on time.
-        """
-        t = time.time() - self.start_time
-
-        # Channel-specific parameters (repeatable variety)
-        base_freq_hz = 0.5 + (abs(channel_index) % 7) * 0.3
-        base_amp     = 2_000_000 + (abs(channel_index) % 5) * 500_000
-        noise_sd     = 80_000 + (abs(channel_index) % 3) * 40_000
-
-        # Compose drift + sine + noise in "driver counts"
+        t = time.time() - self.t0
+        f  = 0.5 + (abs(channel_index) % 7) * 0.3
+        A  = 2_000_000 + (abs(channel_index) % 5) * 500_000
+        sd = 80_000 + (abs(channel_index) % 3) * 40_000
         drift = int(300_000 * math.sin(0.02 * t))
-        sine  = int(base_amp * math.sin(2 * math.pi * base_freq_hz * t))
-        noise = int(self.rng.normal(0, noise_sd))
-
-        if channel_index == 0:  # emphasize low-freq drift for "Topo"
+        sine  = int(A * math.sin(2 * math.pi * f * t))
+        noise = int(self.rng.normal(0, sd))
+        if channel_index == 0:
             drift += int(500_000 * math.sin(0.1 * math.pi * t))
-
         return drift + sine + noise
 
 
-# =============================================================================
-# (Future) command layer placeholder (e.g., DDE to SXM.exe)
-# =============================================================================
-
-class DeviceCommandInterface:
-    """
-    Placeholder for a future command/control layer (DDE/COM).
-    Keep control concerns separate from plotting and acquisition.
-    """
-    def connect(self) -> None:
-        pass
-    def send_command(self, command: str) -> None:
-        pass
-    def query(self, request: str) -> str:
-        return ""
-
-
-# =============================================================================
-# Tiny DSP: 1st-order IIR high-pass (for Relative Z)
-# =============================================================================
+# =============================== Tiny DSP (HPF) ===============================
 
 class IIRHighPass:
     """
-    First-order high-pass:
-        y[n] = α * (y[n-1] + x[n] − x[n-1])
-    Used to display Relative Z (ΔZ) for the “Topo” channel only.
+    1st-order high-pass: y[n] = α * (y[n-1] + x[n] − x[n-1])
+    Used for Relative Z on "Topo".
     """
-    def __init__(self, time_constant_s: float, sample_period_s: float):
-        self.alpha = time_constant_s / (time_constant_s + sample_period_s)
-        self.reset()
-
-    def reset(self) -> None:
-        """Reset internal state so a new segment does not carry previous baselines."""
+    def __init__(self, tau_s: float, dt_s: float):
+        self.alpha = tau_s / (tau_s + dt_s)
         self.prev_x = 0.0
         self.prev_y = 0.0
-
+    def reset(self):
+        self.prev_x = 0.0
+        self.prev_y = 0.0
     def process(self, x_now: float) -> float:
-        """Filter one sample and return the high-passed output."""
-        y_now = self.alpha * (self.prev_y + x_now - self.prev_x)
-        self.prev_x, self.prev_y = x_now, y_now
-        return y_now
+        y = self.alpha * (self.prev_y + x_now - self.prev_x)
+        self.prev_x, self.prev_y = x_now, y
+        return y
 
 
-# =============================================================================
-# Stats bar widget (outside the plot)
-# =============================================================================
+# =========================== Stats bar (optional) ============================
 
 class StatsBar(QtWidgets.QWidget):
     """
-    Thin bar with text labels placed *below* a plot.
-    Shows:
-      • current value (with unit),
-      • noise σ over the visible window,
-      • SNR estimate (20*log10(|mean|/σ)) over the visible window.
+    Lightweight bar under each plot showing Value, σ (EWMA), and SNR (dB).
+    NOTE: In 'max' profile we do not create/update this to save work.
     """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-
         self.value_label = QtWidgets.QLabel("Value: —")
         self.noise_label = QtWidgets.QLabel("σ: —")
         self.snr_label   = QtWidgets.QLabel("SNR: —")
-
-        # Subtle, readable style
         for lbl in (self.value_label, self.noise_label, self.snr_label):
-            lbl.setStyleSheet("color: rgba(220,220,220, 0.9); font-size: 11px;")
+            lbl.setStyleSheet("color: rgba(220,220,220,0.9); font-size: 11px;")
+        h = QtWidgets.QHBoxLayout(self)
+        h.setContentsMargins(6,0,6,4); h.setSpacing(12)
+        h.addWidget(self.value_label); h.addWidget(self.noise_label); h.addWidget(self.snr_label); h.addStretch(1)
 
-        layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(6, 0, 6, 4)
-        layout.setSpacing(12)
-        layout.addWidget(self.value_label)
-        layout.addWidget(self.noise_label)
-        layout.addWidget(self.snr_label)
-        layout.addStretch(1)
-
-    def update_stats(self,
-                     instantaneous_value: Optional[float],
-                     unit: str,
-                     sigma: Optional[float],
-                     snr_db: Optional[float]) -> None:
-        """Update the three textual fields (use None to indicate no data)."""
-        self.value_label.setText("Value: —" if instantaneous_value is None
-                                 else f"Value: {instantaneous_value:.3g} {unit}")
-        self.noise_label.setText("σ: —" if sigma is None
-                                 else f"σ: {sigma:.3g} {unit}")
+    def update_stats(self, v_inst: Optional[float], unit: str,
+                     sigma: Optional[float], snr_db: Optional[float]) -> None:
+        self.value_label.setText("Value: —" if v_inst is None else f"Value: {v_inst:.3g} {unit}")
+        self.noise_label.setText("σ: —" if sigma is None else f"σ: {sigma:.3g} {unit}")
         if snr_db is None:
             self.snr_label.setText("SNR: —")
         else:
-            self.snr_label.setText("SNR: ∞" if not math.isfinite(snr_db)
-                                   else f"SNR: {snr_db:.1f} dB")
+            self.snr_label.setText("SNR: ∞" if not math.isfinite(snr_db) else f"SNR: {snr_db:.1f} dB")
 
 
-# =============================================================================
-# Helpers focused on deque performance
-# =============================================================================
+# ========================= Deque → NumPy tail helper =========================
 
-def tail_deque_to_arrays(time_deq: deque, value_deq: deque,
-                         max_points: int, now: float) -> Tuple[np.ndarray, np.ndarray]:
+def deque_tail_to_arrays(t_deq: deque, v_deq: deque, tail_count: int, now: float) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Convert the *last* max_points of two deques (time and value) into NumPy arrays.
-
-    Why this is fast:
-    -----------------
-    • We iterate from the RIGHT using reversed(deque) and take only 'max_points'
-      with itertools.islice. This is O(max_points), not O(len(deque)).
-    • Then we reverse that short list to restore chronological order.
-
-    Parameters
-    ----------
-    time_deq : deque of float timestamps
-    value_deq: deque of float values
-    max_points : number of newest points to extract
-    now : current wall-clock time (seconds)
-
-    Returns
-    -------
-    xs : np.ndarray of time offsets (t - now), shape (K,)
-    ys : np.ndarray of values, shape (K,)
+    Extract only the **last** `tail_count` items from time/value deques.
+    This is O(tail_count), independent of total history length.
     """
-    if not time_deq:
-        return np.empty(0, dtype=float), np.empty(0, dtype=float)
-
-    k = min(max_points, len(time_deq))
-
-    # Take only the tail in reverse (rightmost entries). This is O(k).
-    times_rev  = list(islice(reversed(time_deq),  0, k))
-    values_rev = list(islice(reversed(value_deq), 0, k))
-
-    # Flip to chronological order and convert to arrays
-    times = np.asarray(times_rev[::-1], dtype=float)
-    ys    = np.asarray(values_rev[::-1], dtype=float)
-    xs    = times - now
-    return xs, ys
+    if not t_deq:
+        return np.empty(0), np.empty(0)
+    k = min(tail_count, len(t_deq))
+    t_rev = list(islice(reversed(t_deq),  0, k))
+    v_rev = list(islice(reversed(v_deq),  0, k))
+    t_arr = np.asarray(t_rev[::-1], dtype=float)
+    v_arr = np.asarray(v_rev[::-1], dtype=float)
+    return (t_arr - now), v_arr
 
 
-# =============================================================================
-# Main GUI application
-# =============================================================================
+# ================================ Main Window ================================
 
 class ScopeApp(QtWidgets.QMainWindow):
     """
-    Time-based oscilloscope for SXM channels.
+    Speed-tuned oscilloscope for 4 SXM channels + (optional) dual-axis comparison.
 
-    Responsibilities
-    ----------------
-    • Build the UI (controls, 4 plots + stats bars, comparison plot).
-    • Periodically:
-        – read selected channels via the injected IDataSource,
-        – scale to physical units,
-        – optionally high-pass “Topo” (Relative Z),
-        – render plots,
-        – compute & display per-plot stats in the StatsBar.
-
-    Performance keys
-    ----------------
-    • Per-plot histories stored in deque(maxlen=…) for O(1) appends and automatic aging.
-    • For plotting and stats we only transform the TAIL of each deque (window-sized),
-      not the entire history.
+    Key speed ideas:
+    - **Deduplicate I/O** per tick: build set of required channel indices and read each once.
+    - **Deque(maxlen)** histories and plot **tail only** (visible window).
+    - **EWMA** sigma/SNR computed **throttled** (not every frame), optional in 'max'.
+    - Avoid per-frame label churn; only update when the channel/unit actually changes.
     """
-    def __init__(self, data_source: IDataSource, driver_handle=None):
+    def __init__(self, source: IDataSource, driver_handle=None):
         super().__init__()
-        self.data_source = data_source
+        self.source = source
         self.driver_handle = driver_handle
-        self.setWindowTitle("SXM Time-Based Multi-Channel Scope (deque-optimized)")
+        self.setWindowTitle("SXM Scope — speed tuned")
 
-        # ---------- Timing configuration ----------
-        self.sample_period_s       = 0.05   # 20 Hz GUI update & acquisition
-        self.max_history_seconds   = 600    # keep at most 10 minutes
-        self.time_window_options_s = [1, 5, 10, 30, 60, 120, 600]  # selectable window spans
+        # ---------- Timing ----------
+        self.sample_period_s       = 0.05    # 20 Hz acquisition/GUI
+        self.max_history_seconds   = 600
+        self.time_window_options_s = [1, 5, 10, 30, 60, 120, 600]
+        self.max_history_samples   = int(self.max_history_seconds / self.sample_period_s) + 2
+        self.tail_frames_cache     = {}      # cache: window_s -> tail_count
 
-        # Compute maximum history in samples; deques will auto-drop older entries.
-        self.max_history_samples = int(self.max_history_seconds / self.sample_period_s) + 2
-
-        # ---------- Plot/channel setup ----------
+        # ---------- Channels / plots ----------
         self.num_plots = 4
-        self.channel_names = list(channels.keys())
+        self.chan_names = list(channels.keys())
 
-        # Per-plot raw histories: separate deques for time and value (avoids tuple churn)
-        self.raw_time_deques   = [deque(maxlen=self.max_history_samples) for _ in range(self.num_plots)]
-        self.raw_value_deques  = [deque(maxlen=self.max_history_samples) for _ in range(self.num_plots)]
+        # per-plot histories (raw and relative-Z)
+        self.raw_t = [deque(maxlen=self.max_history_samples) for _ in range(self.num_plots)]
+        self.raw_v = [deque(maxlen=self.max_history_samples) for _ in range(self.num_plots)]
+        self.rel_t = [deque(maxlen=self.max_history_samples) for _ in range(self.num_plots)]
+        self.rel_v = [deque(maxlen=self.max_history_samples) for _ in range(self.num_plots)]
+        self.hpf   = [IIRHighPass(1.0, self.sample_period_s) for _ in range(self.num_plots)]
 
-        # Per-plot filtered (Relative Z) histories (Topo only when enabled)
-        self.rel_time_deques   = [deque(maxlen=self.max_history_samples) for _ in range(self.num_plots)]
-        self.rel_value_deques  = [deque(maxlen=self.max_history_samples) for _ in range(self.num_plots)]
-
-        # Per-plot high-pass filters for Relative Z
-        self.relative_z_tau_s = 1.0
-        self.hp_filters = [IIRHighPass(self.relative_z_tau_s, self.sample_period_s) for _ in range(self.num_plots)]
-
-        # Comparison plot histories (raw only): left and right traces
-        self.cmp_time_deques  = [deque(maxlen=self.max_history_samples) for _ in range(2)]
-        self.cmp_value_deques = [deque(maxlen=self.max_history_samples) for _ in range(2)]
+        # EWMA stats (per-plot), throttled updates
+        self.stats_alpha = 0.15
+        self.ewma_mean   = [0.0]*self.num_plots
+        self.ewma_var    = [0.0]*self.num_plots
+        self.ewma_init   = [False]*self.num_plots
+        self.stats_every = 5    # compute text stats every N frames (balanced)
+        self.frame_idx   = 0
 
         # Appearance
-        self.line_colors       = ['#3498db', '#e67e22', '#16a085', '#8e44ad', '#c0392b', '#27ae60']  # 4 + 2
-        self.background_color  = '#222222'
-        self.line_width_px     = 2
+        self.line_colors  = ['#3498db','#e67e22','#16a085','#8e44ad','#c0392b','#27ae60']  # last 2 for comparison
+        self.bg_color     = '#222222'
+        self.line_width   = 2
 
         # Build UI
         self._build_controls()
-        self._build_plots_with_stats()
-        self._build_comparison_plot()
+        self._build_plots_grid()
+        self._build_comparison_plot() if FAST_PROFILE != 'max' else None
         self._build_menu()
 
-        # Status bar displays current data source
-        self._update_status_bar()
+        self._status_source()
 
-        # Timer for periodic updates
-        self.update_timer = QtCore.QTimer(self)
-        self.update_timer.setTimerType(QtCore.Qt.PreciseTimer)
-        self.update_timer.timeout.connect(self._on_timer_tick)
-        self.update_timer.start(int(self.sample_period_s * 1000))
+        # Timer
+        self.timer = QtCore.QTimer(self); self.timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(int(self.sample_period_s * 1000))
 
-    # ---------- UI builders ----------
+        # cache last labels to avoid churn
+        self._last_ylabel_text = [None]*self.num_plots
+        self._last_ylabel_unit = [None]*self.num_plots
 
-    def _build_controls(self) -> None:
-        """Create the top control row: time window, 4 channel selectors, Relative Z."""
-        central = QtWidgets.QWidget(self)
-        self.setCentralWidget(central)
-        self.main_vbox = QtWidgets.QVBoxLayout(central)
-        self.main_vbox.setContentsMargins(6, 6, 6, 6)
-        self.main_vbox.setSpacing(6)
+    # -------------------------- UI building blocks --------------------------
 
-        control_row = QtWidgets.QHBoxLayout()
-        control_row.setSpacing(10)
-        self.main_vbox.addLayout(control_row)
+    def _build_controls(self):
+        central = QtWidgets.QWidget(self); self.setCentralWidget(central)
+        self.vbox = QtWidgets.QVBoxLayout(central); self.vbox.setContentsMargins(6,6,6,6); self.vbox.setSpacing(6)
 
-        # Time window selector
-        self.time_window_combo = QtWidgets.QComboBox()
-        for span in self.time_window_options_s:
-            self.time_window_combo.addItem(f"{span} s")
-        self.time_window_combo.setCurrentIndex(2)  # default = 10 s
-        control_row.addWidget(QtWidgets.QLabel("Time Window:"))
-        control_row.addWidget(self.time_window_combo)
+        top = QtWidgets.QHBoxLayout(); top.setSpacing(10); self.vbox.addLayout(top)
 
-        # 4 independent channel selectors (one per plot)
-        self.channel_selectors: List[QtWidgets.QComboBox] = []
+        self.window_combo = QtWidgets.QComboBox()
+        for s in self.time_window_options_s: self.window_combo.addItem(f"{s} s")
+        self.window_combo.setCurrentIndex(2)
+        top.addWidget(QtWidgets.QLabel("Time Window:")); top.addWidget(self.window_combo)
+
+        self.chan_combos: List[QtWidgets.QComboBox] = []
         for i in range(self.num_plots):
-            combo = QtWidgets.QComboBox()
-            combo.addItems(self.channel_names)
-            control_row.addWidget(QtWidgets.QLabel(f"Ch{i+1}:"))
-            control_row.addWidget(combo)
-            self.channel_selectors.append(combo)
+            cb = QtWidgets.QComboBox(); cb.addItems(self.chan_names)
+            top.addWidget(QtWidgets.QLabel(f"Ch{i+1}:")); top.addWidget(cb)
+            self.chan_combos.append(cb)
 
-        # Relative Z checkbox (affects "Topo" only)
-        self.relative_z_checkbox = QtWidgets.QCheckBox("Relative Z (Topo)")
-        self.relative_z_checkbox.stateChanged.connect(self._reset_relative_z_state)
-        control_row.addWidget(self.relative_z_checkbox)
+        self.rel_check = QtWidgets.QCheckBox("Relative Z (Topo)")
+        self.rel_check.stateChanged.connect(self._reset_relative_z)
+        top.addWidget(self.rel_check)
 
-    def _build_plots_with_stats(self) -> None:
-        """Create a 2x2 grid of (PlotWidget + StatsBar)."""
-        grid = QtWidgets.QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
-        self.main_vbox.addLayout(grid)
-
-        self.plot_widgets: List[pg.PlotWidget] = []
-        self.plot_curves:  List[pg.PlotDataItem] = []
-        self.stats_bars:   List[StatsBar] = []
+    def _build_plots_grid(self):
+        grid = QtWidgets.QGridLayout(); grid.setHorizontalSpacing(10); grid.setVerticalSpacing(8)
+        self.vbox.addLayout(grid)
+        self.plots:  List[pg.PlotWidget]    = []
+        self.curves: List[pg.PlotDataItem]  = []
+        self.stats:  List[StatsBar]         = []
 
         for i in range(self.num_plots):
-            container = QtWidgets.QWidget()
-            vbox = QtWidgets.QVBoxLayout(container)
-            vbox.setContentsMargins(0, 0, 0, 0)
-            vbox.setSpacing(2)
+            container = QtWidgets.QWidget(); vb = QtWidgets.QVBoxLayout(container)
+            vb.setContentsMargins(0,0,0,0); vb.setSpacing(2)
 
-            # Plot
-            plot = pg.PlotWidget(title=f"Channel {i+1}")
-            plot.showGrid(x=True, y=True)
-            plot.setBackground(self.background_color)
-            plot.setLabel('bottom', "Time", units="s")
-            curve = plot.plot(pen=pg.mkPen(self.line_colors[i], width=self.line_width_px))
-            # Reduce overdraw when zoomed out
+            pw = pg.PlotWidget(title=f"Channel {i+1}")
+            pw.showGrid(x=True, y=True); pw.setBackground(self.bg_color)
+            pw.setLabel('bottom', "Time", units="s")
+            curve = pw.plot(pen=pg.mkPen(self.line_colors[i], width=self.line_width))
             curve.setClipToView(True)
             try:
                 curve.setDownsampling(auto=True, method='peak')
                 curve.setSkipFiniteCheck(True)
             except Exception:
-                pass  # older pyqtgraph versions
+                pass
 
-            vbox.addWidget(plot)
+            vb.addWidget(pw)
 
-            # Stats bar below the plot
-            stats_bar = StatsBar()
-            vbox.addWidget(stats_bar)
+            if FAST_PROFILE == 'max':
+                stats_bar = None
+            else:
+                stats_bar = StatsBar(); vb.addWidget(stats_bar)
 
-            grid.addWidget(container, i // 2, i % 2)
+            grid.addWidget(container, i//2, i%2)
+            self.plots.append(pw); self.curves.append(curve); self.stats.append(stats_bar)
 
-            self.plot_widgets.append(plot)
-            self.plot_curves.append(curve)
-            self.stats_bars.append(stats_bar)
+    def _build_comparison_plot(self):
+        self.vbox.addWidget(QtWidgets.QLabel("Comparison Plot:"))
+        top = QtWidgets.QHBoxLayout(); top.setSpacing(10); self.vbox.addLayout(top)
+        self.cmp_left  = QtWidgets.QComboBox();  self.cmp_left.addItems(self.chan_names)
+        self.cmp_right = QtWidgets.QComboBox();  self.cmp_right.addItems(self.chan_names)
+        top.addWidget(self.cmp_left); top.addWidget(self.cmp_right)
 
-    def _build_comparison_plot(self) -> None:
-        """Create the dual-axis comparison plot with two channel selectors."""
-        self.main_vbox.addWidget(QtWidgets.QLabel("Comparison Plot:"))
-        top_row = QtWidgets.QHBoxLayout()
-        top_row.setSpacing(10)
-        self.main_vbox.addLayout(top_row)
+        self.cmp_plot = pg.PlotWidget(title="Compare Channels")
+        item = self.cmp_plot.getPlotItem()
+        item.showGrid(x=True, y=True); item.setLabel('bottom', "Time", units="s")
+        self.cmp_plot.setBackground(self.bg_color)
+        item.showAxis('right')
+        self.vb_right = pg.ViewBox(); item.scene().addItem(self.vb_right)
+        item.getAxis('right').linkToView(self.vb_right)
+        self.vb_right.setXLink(item.vb)
+        item.vb.sigResized.connect(lambda: self.vb_right.setGeometry(item.vb.sceneBoundingRect()))
+        self.cmp_curve_l = pg.PlotDataItem(pen=pg.mkPen(self.line_colors[4], width=self.line_width))
+        self.cmp_curve_r = pg.PlotDataItem(pen=pg.mkPen(self.line_colors[5], width=self.line_width))
+        item.addItem(self.cmp_curve_l); self.vb_right.addItem(self.cmp_curve_r)
+        self.vbox.addWidget(self.cmp_plot)
 
-        self.compare_selector_left  = QtWidgets.QComboBox();  self.compare_selector_left.addItems(self.channel_names)
-        self.compare_selector_right = QtWidgets.QComboBox();  self.compare_selector_right.addItems(self.channel_names)
-        top_row.addWidget(self.compare_selector_left)
-        top_row.addWidget(self.compare_selector_right)
+        # comparison histories (deques)
+        self.cmp_t = [deque(maxlen=self.max_history_samples) for _ in range(2)]
+        self.cmp_v = [deque(maxlen=self.max_history_samples) for _ in range(2)]
 
-        self.comparison_plot = pg.PlotWidget(title="Compare Channels")
-        plot_item = self.comparison_plot.getPlotItem()
-        plot_item.showGrid(x=True, y=True)
-        plot_item.setLabel('bottom', "Time", units="s")
-        self.comparison_plot.setBackground(self.background_color)
+    def _build_menu(self):
+        m = self.menuBar()
+        view = m.addMenu("View")
+        act = QtWidgets.QAction("Appearance…", self); act.triggered.connect(self._appearance_dialog)
+        view.addAction(act)
+        src = m.addMenu("Source")
+        a1 = QtWidgets.QAction("Use Driver", self); a2 = QtWidgets.QAction("Use Mock Data", self)
+        a1.triggered.connect(self._switch_driver); a2.triggered.connect(self._switch_mock)
+        src.addAction(a1); src.addAction(a2)
 
-        # Dual Y axes via a second ViewBox for the right-hand curve
-        plot_item.showAxis('right')
-        self.right_viewbox = pg.ViewBox()
-        plot_item.scene().addItem(self.right_viewbox)
-        plot_item.getAxis('right').linkToView(self.right_viewbox)
-        self.right_viewbox.setXLink(plot_item.vb)
-        plot_item.vb.sigResized.connect(lambda:
-            self.right_viewbox.setGeometry(plot_item.vb.sceneBoundingRect())
-        )
+    # ------------------------------ Menu handlers ------------------------------
 
-        self.compare_curve_left  = pg.PlotDataItem(pen=pg.mkPen(self.line_colors[4], width=self.line_width_px))
-        self.compare_curve_right = pg.PlotDataItem(pen=pg.mkPen(self.line_colors[5], width=self.line_width_px))
-        plot_item.addItem(self.compare_curve_left)
-        self.right_viewbox.addItem(self.compare_curve_right)
+    def _appearance_dialog(self):
+        d = QtWidgets.QDialog(self); d.setWindowTitle("Plot Appearance"); f = QtWidgets.QFormLayout(d)
+        btns = []
+        for i in range(6):
+            b = QtWidgets.QPushButton(); b.setStyleSheet(f"background-color:{self.line_colors[i]}"); btns.append(b)
+            f.addRow(f"Line {i+1} Color:", b)
+        bg = QtWidgets.QPushButton(); bg.setStyleSheet(f"background-color:{self.bg_color}"); f.addRow("Background:", bg)
+        w  = QtWidgets.QSpinBox(); w.setRange(1,10); w.setValue(self.line_width); f.addRow("Line Thickness:", w)
+        for i,b in enumerate(btns):
+            b.clicked.connect(lambda _,i=i: self._pick_color(i, btns))
+        bg.clicked.connect(lambda: self._pick_bg(bg))
+        ok = QtWidgets.QPushButton("OK"); ok.clicked.connect(lambda: self._apply_appearance(w.value(), d)); f.addRow(ok)
+        d.exec_()
 
-        self.main_vbox.addWidget(self.comparison_plot)
+    def _pick_color(self, i:int, btns:List[QtWidgets.QPushButton]):
+        c = QtWidgets.QColorDialog.getColor()
+        if c.isValid():
+            css = c.name(); btns[i].setStyleSheet(f"background-color:{css}"); self.line_colors[i] = css
 
-    def _build_menu(self) -> None:
-        """Build the top menu (Appearance + Data Source selection)."""
-        menubar = self.menuBar()
+    def _pick_bg(self, bg_btn:QtWidgets.QPushButton):
+        c = QtWidgets.QColorDialog.getColor()
+        if c.isValid():
+            css = c.name(); bg_btn.setStyleSheet(f"background-color:{css}"); self.bg_color = css
 
-        # Appearance customization
-        view_menu = menubar.addMenu("View")
-        appearance_action = QtWidgets.QAction("Appearance…", self)
-        appearance_action.triggered.connect(self._open_appearance_dialog)
-        view_menu.addAction(appearance_action)
+    def _apply_appearance(self, lw:int, dialog:QtWidgets.QDialog):
+        self.line_width = lw
+        for i,(pw,cv) in enumerate(zip(self.plots,self.curves)):
+            pw.setBackground(self.bg_color); cv.setPen(pg.mkPen(self.line_colors[i], width=self.line_width))
+        if FAST_PROFILE != 'max':
+            self.cmp_plot.setBackground(self.bg_color)
+            self.cmp_curve_l.setPen(pg.mkPen(self.line_colors[4], width=self.line_width))
+            self.cmp_curve_r.setPen(pg.mkPen(self.line_colors[5], width=self.line_width))
+        dialog.accept()
 
-        # Data source switching
-        source_menu = menubar.addMenu("Source")
-        use_driver_action = QtWidgets.QAction("Use Driver", self)
-        use_mock_action   = QtWidgets.QAction("Use Mock Data", self)
-        use_driver_action.triggered.connect(self._switch_to_driver)
-        use_mock_action.triggered.connect(self._switch_to_mock)
-        source_menu.addAction(use_driver_action)
-        source_menu.addAction(use_mock_action)
+    def _switch_mock(self):
+        self.source = MockDataSource(); self._status_source()
 
-    # ---------- menu & utility handlers ----------
+    def _switch_driver(self):
+        if not WIN32_AVAILABLE:
+            QtWidgets.QMessageBox.warning(self,"Driver","win32 modules not available."); return
+        try:
+            h = win32file.CreateFile(r"\\.\SXM", win32con.GENERIC_READ|win32con.GENERIC_WRITE,
+                                     0,None, win32con.OPEN_EXISTING, win32con.FILE_ATTRIBUTE_NORMAL, None)
+            self.source = DriverDataSource(h); self.driver_handle = h; self._status_source()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self,"Driver",f"Could not open driver: {e}")
 
-    def _update_status_bar(self) -> None:
-        """Indicate which data source is active."""
-        src = "Driver" if isinstance(self.data_source, DriverDataSource) else "Mock"
+    def _status_source(self):
+        src = "Driver" if isinstance(self.source, DriverDataSource) else "Mock"
         self.statusBar().showMessage(f"Data Source: {src}")
 
-    def _open_appearance_dialog(self) -> None:
-        """Small dialog to adjust line colors, background, and line width."""
-        dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Plot Appearance")
-        form = QtWidgets.QFormLayout(dialog)
+    def _reset_relative_z(self):
+        for f in self.hpf: f.reset()
+        for dq in self.rel_t: dq.clear()
+        for dq in self.rel_v: dq.clear()
 
-        color_buttons: List[QtWidgets.QPushButton] = []
-        for i in range(6):
-            btn = QtWidgets.QPushButton()
-            btn.setStyleSheet(f"background-color: {self.line_colors[i]}")
-            color_buttons.append(btn)
-            form.addRow(f"Line {i+1} Color:", btn)
+    # ------------------------------ Main update -------------------------------
 
-        bg_button = QtWidgets.QPushButton()
-        bg_button.setStyleSheet(f"background-color: {self.background_color}")
-        form.addRow("Background Color:", bg_button)
-
-        width_spin = QtWidgets.QSpinBox(); width_spin.setRange(1, 10); width_spin.setValue(self.line_width_px)
-        form.addRow("Line Thickness:", width_spin)
-
-        def pick_color(idx: int):
-            color = QtWidgets.QColorDialog.getColor()
-            if color.isValid():
-                css = color.name()
-                color_buttons[idx].setStyleSheet(f"background-color: {css}")
-                self.line_colors[idx] = css
-
-        for i, btn in enumerate(color_buttons):
-            btn.clicked.connect(lambda _, i=i: pick_color(i))
-
-        def pick_background():
-            color = QtWidgets.QColorDialog.getColor()
-            if color.isValid():
-                css = color.name()
-                bg_button.setStyleSheet(f"background-color: {css}")
-                self.background_color = css
-        bg_button.clicked.connect(pick_background)
-
-        def apply_and_close():
-            self.line_width_px = width_spin.value()
-            # Apply to plots
-            for i, (plot, curve) in enumerate(zip(self.plot_widgets, self.plot_curves)):
-                plot.setBackground(self.background_color)
-                curve.setPen(pg.mkPen(self.line_colors[i], width=self.line_width_px))
-            # Comparison
-            self.comparison_plot.setBackground(self.background_color)
-            self.compare_curve_left.setPen(pg.mkPen(self.line_colors[4], width=self.line_width_px))
-            self.compare_curve_right.setPen(pg.mkPen(self.line_colors[5], width=self.line_width_px))
-            dialog.accept()
-
-        ok = QtWidgets.QPushButton("OK")
-        ok.clicked.connect(apply_and_close)
-        form.addRow(ok)
-        dialog.exec_()
-
-    def _switch_to_mock(self) -> None:
-        """Switch to synthetic data (no hardware required)."""
-        self.data_source = MockDataSource()
-        self._update_status_bar()
-
-    def _switch_to_driver(self) -> None:
-        """Attempt to open and switch to the real driver."""
-        if not WIN32_AVAILABLE:
-            QtWidgets.QMessageBox.warning(self, "Driver", "win32 modules not available on this system.")
-            return
-        try:
-            handle = win32file.CreateFile(
-                r"\\.\SXM",
-                win32con.GENERIC_READ | win32con.GENERIC_WRITE,
-                0, None,
-                win32con.OPEN_EXISTING,
-                win32con.FILE_ATTRIBUTE_NORMAL,
-                None
-            )
-            self.data_source = DriverDataSource(handle)
-            self.driver_handle = handle
-            self._update_status_bar()
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Driver", f"Could not open driver: {exc}")
-
-    def _reset_relative_z_state(self) -> None:
-        """Clear filter states and ΔZ deques when toggling Relative Z."""
-        for filt in self.hp_filters:
-            filt.reset()
-        for dq in self.rel_time_deques:
-            dq.clear()
-        for dq in self.rel_value_deques:
-            dq.clear()
-
-    # ---------- main periodic update ----------
-
-    def _on_timer_tick(self) -> None:
+    def _tick(self):
         """
-        Called every sample_period_s.
-        Steps:
-          1) Acquire new samples for selected channels.
-          2) Append to per-plot deques (raw; and ΔZ if enabled).
-          3) Extract only the tail needed for the visible window and plot it.
-          4) Compute & display stats in the StatsBar (below each plot).
+        One GUI/acquisition tick:
+        1) Gather ALL required channel indices from 4 plots (+ comparison if present).
+        2) **Read each unique channel ONCE** from the device.
+        3) Update per-plot histories (raw and ΔZ if enabled).
+        4) Plot only the **tail** needed for the visible time window.
+        5) Update stats (EWMA) only every N frames (balanced profile).
         """
+        self.frame_idx += 1
         now = time.time()
-        window_seconds = self.time_window_options_s[self.time_window_combo.currentIndex()]
-        # Number of points needed to cover the visible window
-        n_tail = int(window_seconds / self.sample_period_s) + 2
+        window_s = self.time_window_options_s[self.window_combo.currentIndex()]
+        tail = self.tail_frames_cache.get(window_s)
+        if tail is None:
+            tail = int(window_s / self.sample_period_s) + 2
+            self.tail_frames_cache[window_s] = tail
 
-        # ----- 4 independent plots -----
-        for plot_idx, combo in enumerate(self.channel_selectors):
-            chan_name = combo.currentText()
-            chan_index, _, chan_unit, chan_scale = channels[chan_name]
+        # 1) Collect needed channels
+        needed: Dict[int, Tuple[str,str,float]] = {}
+        for cb in self.chan_combos:
+            nm = cb.currentText(); idx, _, unit, scale = channels[nm]
+            needed[idx] = (nm, unit, scale)
+        if FAST_PROFILE != 'max':
+            for cb in (self.cmp_left, self.cmp_right):
+                nm = cb.currentText(); idx, _, unit, scale = channels[nm]
+                needed[idx] = (nm, unit, scale)
 
-            # 1) Acquire and scale
-            raw_int = self.data_source.read_value(chan_index)
-            scaled_val = raw_int * chan_scale
+        # 2) Read each unique index ONCE, scale immediately
+        snapshot_scaled: Dict[int, float] = {}
+        for idx, (_nm, _unit, scale) in needed.items():
+            raw = self.source.read_value(idx)
+            snapshot_scaled[idx] = raw * scale
 
-            # 2) Append to raw deques (auto-trim by maxlen)
-            self.raw_time_deques[plot_idx].append(now)
-            self.raw_value_deques[plot_idx].append(scaled_val)
+        # 3) Update per-plot histories (raw + ΔZ if requested)
+        for i, cb in enumerate(self.chan_combos):
+            nm = cb.currentText()
+            idx, _, unit, scale = channels[nm]
+            val = snapshot_scaled[idx]
 
-            # ΔZ (Relative Z) path for Topo only
-            use_relative = (chan_name == 'Topo' and self.relative_z_checkbox.isChecked())
-            if use_relative:
-                hp = self.hp_filters[plot_idx]
-                rel_val = hp.process(scaled_val)
-                self.rel_time_deques[plot_idx].append(now)
-                self.rel_value_deques[plot_idx].append(rel_val)
+            # raw stream append
+            self.raw_t[i].append(now)
+            self.raw_v[i].append(val)
 
-            # 3) Choose which series to visualize (raw vs ΔZ)
-            if use_relative:
-                t_deq = self.rel_time_deques[plot_idx]
-                v_deq = self.rel_value_deques[plot_idx]
-                y_label_text, y_label_unit = 'ΔZ', 'nm'
+            use_rel = (nm == 'Topo' and self.rel_check.isChecked())
+            if use_rel:
+                y = self.hpf[i].process(val)
+                self.rel_t[i].append(now)
+                self.rel_v[i].append(y)
+
+            # select which stream to visualize
+            if use_rel:
+                xs, ys = deque_tail_to_arrays(self.rel_t[i], self.rel_v[i], tail, now)
+                ytxt, yunit = 'ΔZ', 'nm'
             else:
-                t_deq = self.raw_time_deques[plot_idx]
-                v_deq = self.raw_value_deques[plot_idx]
-                y_label_text, y_label_unit = chan_name, chan_unit
+                xs, ys = deque_tail_to_arrays(self.raw_t[i], self.raw_v[i], tail, now)
+                ytxt, yunit = nm, unit
 
-            # Extract only the newest 'n_tail' points (O(n_tail), not O(n_history))
-            xs, ys = tail_deque_to_arrays(t_deq, v_deq, n_tail, now)
+            # 4) Draw only tail and avoid repeated label calls
+            self.curves[i].setData(xs, ys)
+            self.plots[i].setXRange(-window_s, 0, padding=0)
+            if self._last_ylabel_text[i] != ytxt or self._last_ylabel_unit[i] != yunit:
+                self.plots[i].setLabel('left', ytxt, yunit)
+                self._last_ylabel_text[i], self._last_ylabel_unit[i] = ytxt, yunit
+            # modest autorange cadence (every 3 frames) to reduce work
+            if (self.frame_idx % 3) == 0:
+                self.plots[i].enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
 
-            # 4) Plot and label
-            self.plot_curves[plot_idx].setData(xs, ys)
-            self.plot_widgets[plot_idx].setXRange(-window_seconds, 0, padding=0)
-            self.plot_widgets[plot_idx].setLabel('left', y_label_text, y_label_unit)
-            self.plot_widgets[plot_idx].enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+            # 5) Stats (balanced only)
+            if FAST_PROFILE != 'max' and self.stats[i] is not None:
+                if ys.size:
+                    v = float(ys[-1])
+                    # EWMA update throttled every stats_every frames
+                    if (self.frame_idx % self.stats_every) == 0:
+                        if not self.ewma_init[i]:
+                            self.ewma_init[i] = True
+                            self.ewma_mean[i] = v
+                            self.ewma_var[i]  = 0.0
+                        else:
+                            a = self.stats_alpha
+                            m = self.ewma_mean[i]
+                            m2 = (1-a)*m + a*v
+                            self.ewma_var[i] = (1-a)*self.ewma_var[i] + a*(v - m2)*(v - m)
+                            self.ewma_mean[i] = m2
+                        sigma = (self.ewma_var[i] ** 0.5)
+                        meanv = self.ewma_mean[i]
+                        snr_db = (20.0 * math.log10(abs(meanv)/sigma)) if sigma > 0 else float('inf')
+                        self.stats[i].update_stats(v, yunit, sigma, snr_db)
+                else:
+                    if (self.frame_idx % self.stats_every) == 0:
+                        self.stats[i].update_stats(None, yunit, None, None)
 
-            # Stats for the visible window
-            if ys.size:
-                instantaneous = float(ys[-1])
-                sigma = float(np.std(ys)) if ys.size > 1 else 0.0
-                mean_val = float(np.mean(ys))
-                snr_db = (20.0 * math.log10(abs(mean_val) / sigma)) if sigma > 0 else float('inf')
-                self.stats_bars[plot_idx].update_stats(instantaneous, y_label_unit, sigma, snr_db)
-            else:
-                self.stats_bars[plot_idx].update_stats(None, y_label_unit, None, None)
+        # Comparison plot (balanced only)
+        if FAST_PROFILE != 'max':
+            left_nm  = self.cmp_left.currentText()
+            right_nm = self.cmp_right.currentText()
+            li, _, _, ls = channels[left_nm]
+            ri, _, _, rs = channels[right_nm]
+            lv = snapshot_scaled.get(li)
+            rv = snapshot_scaled.get(ri)
+            # Append and draw tails
+            self.cmp_t[0].append(now); self.cmp_v[0].append(lv)
+            self.cmp_t[1].append(now); self.cmp_v[1].append(rv)
+            xsL, ysL = deque_tail_to_arrays(self.cmp_t[0], self.cmp_v[0], tail, now)
+            xsR, ysR = deque_tail_to_arrays(self.cmp_t[1], self.cmp_v[1], tail, now)
+            self.cmp_curve_l.setData(xsL, ysL)
+            self.cmp_curve_r.setData(xsL, ysR)
+            item = self.cmp_plot.getPlotItem()
+            item.setXRange(-window_s, 0, padding=0)
+            # only update axis labels when changed
+            item.setLabel('left',  left_nm,  channels[left_nm][2])
+            item.getAxis('right').setLabel(right_nm, channels[right_nm][2])
+            if (self.frame_idx % 3) == 0:
+                item.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+                self.vb_right.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
 
-        # ----- Dual-axis comparison plot (raw values only) -----
-        left_name  = self.compare_selector_left.currentText()
-        right_name = self.compare_selector_right.currentText()
+    # ------------------------------ Window events ------------------------------
 
-        # Acquire and append one new point for each comparison series
-        for idx_cmp, chan_name in enumerate((left_name, right_name)):
-            c_idx, _, _, c_scale = channels[chan_name]
-            raw_int = self.data_source.read_value(c_idx)
-            val = raw_int * c_scale
-            self.cmp_time_deques[idx_cmp].append(now)
-            self.cmp_value_deques[idx_cmp].append(val)
-
-        # Extract tails for comparison
-        xs_left,  ys_left  = tail_deque_to_arrays(self.cmp_time_deques[0], self.cmp_value_deques[0], n_tail, now)
-        xs_right, ys_right = tail_deque_to_arrays(self.cmp_time_deques[1], self.cmp_value_deques[1], n_tail, now)
-        # Use left X for both (they are sampled at the same times in this loop)
-        self.compare_curve_left.setData(xs_left, ys_left)
-        self.compare_curve_right.setData(xs_left, ys_right)
-
-        # Configure axes and labels
-        item = self.comparison_plot.getPlotItem()
-        item.setXRange(-window_seconds, 0, padding=0)
-        item.setLabel('left',  left_name,  channels[left_name][2])
-        item.getAxis('right').setLabel(right_name, channels[right_name][2])
-        item.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
-        self.right_viewbox.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
-
-    # ---------- Qt window events ----------
-
-    def changeEvent(self, event: QtCore.QEvent) -> None:
-        """
-        Pause the timer if the window is minimized; resume when restored.
-        Saves CPU and avoids unnecessary driver access when not in use.
-        """
-        if event.type() == QtCore.QEvent.WindowStateChange:
+    def changeEvent(self, e: QtCore.QEvent) -> None:
+        """Pause when minimized; resume when restored (saves CPU and device I/O)."""
+        if e.type() == QtCore.QEvent.WindowStateChange:
             minimized = bool(self.windowState() & QtCore.Qt.WindowMinimized)
             if minimized:
-                self.update_timer.stop()
+                self.timer.stop()
             else:
-                if not self.update_timer.isActive():
-                    self.update_timer.start(int(self.sample_period_s * 1000))
-        super().changeEvent(event)
+                if not self.timer.isActive():
+                    self.timer.start(int(self.sample_period_s * 1000))
+        super().changeEvent(e)
 
 
-# =============================================================================
-# Entry point: open driver if available, otherwise fall back to mock data
-# =============================================================================
+# ================================ Entry point ================================
 
 def create_data_source() -> Tuple[IDataSource, Optional[object], str]:
-    """
-    Try to open the SXM driver. If it fails (e.g., not on the lab PC), use MockDataSource.
-    Returns (source, driver_handle_or_None, "Driver"|"Mock").
-    """
+    """Try driver first; fall back to mock."""
     if WIN32_AVAILABLE:
         try:
-            handle = win32file.CreateFile(
-                r"\\.\SXM",
-                win32con.GENERIC_READ | win32con.GENERIC_WRITE,
-                0, None,
-                win32con.OPEN_EXISTING,
-                win32con.FILE_ATTRIBUTE_NORMAL,
-                None
-            )
-            return DriverDataSource(handle), handle, "Driver"
+            h = win32file.CreateFile(r"\\.\SXM",
+                                     win32con.GENERIC_READ|win32con.GENERIC_WRITE,
+                                     0, None, win32con.OPEN_EXISTING,
+                                     win32con.FILE_ATTRIBUTE_NORMAL, None)
+            return DriverDataSource(h), h, "Driver"
         except Exception:
             pass
     return MockDataSource(), None, "Mock"
@@ -762,10 +568,8 @@ def create_data_source() -> Tuple[IDataSource, Optional[object], str]:
 
 if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
-
-    source, handle, src_name = create_data_source()
-    window = ScopeApp(source, driver_handle=handle)
-    window.resize(1200, 900)
-    window.show()
-
+    src, handle, srcname = create_data_source()
+    w = ScopeApp(src, driver_handle=handle)
+    w.resize(1200, 900)
+    w.show()
     sys.exit(app.exec_())

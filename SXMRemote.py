@@ -26,6 +26,8 @@ import time
 from win32 import win32event #manu 
 from ctypes import POINTER, WINFUNCTYPE, c_char_p, c_void_p, c_int, c_ulong, c_char_p
 from ctypes.wintypes import BOOL, DWORD, BYTE, INT, LPCWSTR, UINT, ULONG
+from ctypes import POINTER, byref, c_ulong
+from ctypes.wintypes import BOOL, HWND, MSG, UINT
 from ctypes import byref, create_string_buffer
 import configparser
 
@@ -412,8 +414,7 @@ class MyMsgClass(threading.Thread):
     def run(self):
         """Run the main windows message loop."""
         # Import necessary ctypes components for Windows API calls
-        from ctypes import POINTER, byref, c_ulong
-        from ctypes.wintypes import BOOL, HWND, MSG, UINT
+
 
         # Define types for the Windows message structure and function return types
         LPMSG = POINTER(MSG)
