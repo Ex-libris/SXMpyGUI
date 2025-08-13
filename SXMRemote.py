@@ -390,31 +390,51 @@ class DDEClient(object):
         return self.GetPara(TopicItem)  # Retrieve the parameter value
 
 
-class MyMsgClass (threading.Thread):
+class MyMsgClass(threading.Thread):
     """
-        A threading
+    MyMsgClass is a subclass of threading.Thread that runs a Windows message loop
+    in a separate thread. This class is useful for handling Windows messages 
+    in a GUI application without blocking the main thread.
+
+    Attributes:
+        None
+
+    Methods:
+        run(): Starts the message loop that processes Windows messages.
     """
-    def __init__ (self):
+    
+    def __init__(self):
+        """
+        Initializes the MyMsgClass instance and starts the threading.Thread.
+        """
         threading.Thread.__init__(self)
+
     def run(self):
         """Run the main windows message loop."""
+        # Import necessary ctypes components for Windows API calls
         from ctypes import POINTER, byref, c_ulong
         from ctypes.wintypes import BOOL, HWND, MSG, UINT
 
+        # Define types for the Windows message structure and function return types
         LPMSG = POINTER(MSG)
         LRESULT = c_ulong
+        
+        # Get the function pointers for Windows API functions
         GetMessage = get_winfunc("user32", "GetMessageW", BOOL, (LPMSG, HWND, UINT, UINT))
         TranslateMessage = get_winfunc("user32", "TranslateMessage", BOOL, (LPMSG,))
-        # restype = LRESULT
         DispatchMessage = get_winfunc("user32", "DispatchMessageW", LRESULT, (LPMSG,))
 
+        # Create a MSG structure to hold the message
         msg = MSG()
         lpmsg = byref(msg)
-        print ("Debug: Start Msg loop")
+        
+        print("Debug: Start Msg loop")
+        
+        # Start the message loop
         while GetMessage(lpmsg, HWND(), 0, 0) > 0:
-            TranslateMessage(lpmsg)
-            DispatchMessage(lpmsg)
-            print ("loop")
+            TranslateMessage(lpmsg)  # Translate the message to a more understandable format
+            DispatchMessage(lpmsg)   # Dispatch the message to the appropriate window procedure
+            print("loop")  # Debug output to indicate the loop is running
 
 
 def loop():
