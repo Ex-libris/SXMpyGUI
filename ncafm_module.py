@@ -34,11 +34,11 @@ class ControlPanel(QtWidgets.QWidget):
 
     PARAM_MAP: Dict[str, Tuple[str, str]] = {
         # key       EditXX   Label
-        "amp_ki":  ("Edit5",  "Amplitude Ki"),
-        "amp_kp":  ("Edit6",  "Amplitude Kp"),
+        "amp_ki":  ("Edit24",  "Amplitude Ki"),
+        "amp_kp":  ("Edit32"  "Amplitude Kp"),
         "pll_kp":  ("Edit27", "PLL Kp"),
         "pll_ki":  ("Edit22", "PLL Ki"),
-        "amp_ref": ("Edit10", "Amplitude Ref"),
+        "amp_ref": ("Edit23", "Amplitude Ref"),
         "freq_ref":("Edit15", "Frequency Ref"),
     }
 
