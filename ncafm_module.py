@@ -239,7 +239,12 @@ class StepTestTab(QtWidgets.QWidget):
         self.preview_btn = QtWidgets.QPushButton("Preview"); self.preview_btn.setFixedWidth(90)
         self.preview_btn.clicked.connect(self.preview_pattern); ctrl.addWidget(self.preview_btn, row, col); col += 1
         self.start_btn = QtWidgets.QPushButton("Start"); self.start_btn.setFixedWidth(90)
-        self.start_btn.clicked.connect(self.start_test); ctrl.addWidget(self.start_btn, row, col)
+        self.start_btn.clicked.connect(self.start_test)
+        ctrl.addWidget(self.start_btn, row, col); col += 1
+        self.stop_btn = QtWidgets.QPushButton("Stop"); self.stop_btn.setFixedWidth(90)
+        self.stop_btn.clicked.connect(self.stop_test)
+        self.stop_btn.setEnabled(False)
+        ctrl.addWidget(self.stop_btn, row, col)
 
         layout.addWidget(ctrl_widget)
 
@@ -292,10 +297,20 @@ class StepTestTab(QtWidgets.QWidget):
     def start_test(self):
         self.preview_pattern()
         self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
         self.step_index = 0
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.perform_step)
         self.timer.start(int(self.period.value() * 1000))
+
+    def stop_test(self):
+        """Stop an ongoing step test."""
+        if self.timer and self.timer.isActive():
+            self.timer.stop()
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            self.log_output.append(f"[{ts}] Test stopped by user.")
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
 
     def perform_step(self):
         _, edit_code = self.param_combo.currentData()
@@ -311,6 +326,7 @@ class StepTestTab(QtWidgets.QWidget):
             # Stop on error
             self.timer.stop()
             self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
             return
 
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
