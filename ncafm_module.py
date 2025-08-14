@@ -337,6 +337,174 @@ class StepTestTab(QtWidgets.QWidget):
         if self.step_index >= self.steps.value():
             self.timer.stop()
             self.start_btn.setEnabled(True)
+# ---------------- Tab 3: Setup Wizard (qPlus @ 8 K) ----------------
+class SetupWizardTab(QtWidgets.QWidget):
+    """
+    Suggest initial NC-AFM parameters from sweep inputs (f0, Q, amplitudes, output gain).
+    - Amplitude loop: Ki ≈ 5e8/Q; Kp ≈ 5e12/Q at ±1 V (scale inversely with output gain). [SXM manual]
+    - PLL: Used frequency = f0; Kp ≈ clamp(5e4/Q, 0.1, 5.0); Ki ≈ Kp/10  (conservative, refine with Step Test).
+    All writes go through write_param(...): EDIT->ScanPara('EditXX', v), DNC->DNCPara(n, v).
+    """
+
+    def __init__(self, dde_client):
+        super().__init__()
+        self.dde = dde_client
+
+        # Build a quick map from logical keys to codes from existing PARAMS
+        # e.g. key 'amp_ki' -> ('EDIT','Edit24'), etc.
+        self.key_to_code = {key: (ptype, pcode) for key, (ptype, pcode), _ in PARAMS}
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # ---- Inputs panel
+        box = QtWidgets.QGroupBox("Inputs from frequency sweep / initial conditions")
+        form = QtWidgets.QGridLayout(box)
+        form.setContentsMargins(10, 8, 10, 8)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(6)
+
+        r = 0
+        form.addWidget(QtWidgets.QLabel("Resonance f₀ (Hz):"), r, 0, alignment=QtCore.Qt.AlignRight)
+        self.f0 = QtWidgets.QDoubleSpinBox(); self.f0.setDecimals(1); self.f0.setRange(1.0, 1e9); self.f0.setValue(30000.0); self.f0.setMaximumWidth(130)
+        form.addWidget(self.f0, r, 1)
+
+        form.addWidget(QtWidgets.QLabel("Quality factor Q:"), r, 2, alignment=QtCore.Qt.AlignRight)
+        self.Q = QtWidgets.QDoubleSpinBox(); self.Q.setDecimals(0); self.Q.setRange(100.0, 1e7); self.Q.setValue(50000.0); self.Q.setMaximumWidth(130)
+        form.addWidget(self.Q, r, 3)
+
+        r += 1
+        form.addWidget(QtWidgets.QLabel("Free amplitude (GUI units):"), r, 0, alignment=QtCore.Qt.AlignRight)
+        self.A_free = QtWidgets.QDoubleSpinBox(); self.A_free.setDecimals(6); self.A_free.setRange(0.0, 1e9); self.A_free.setValue(1.0); self.A_free.setMaximumWidth(130)
+        self.A_free.setToolTip("Amplitude in the SAME unit currently shown in SXM (RMS voltage or nmpp depending on your setup).")
+        form.addWidget(self.A_free, r, 1)
+
+        form.addWidget(QtWidgets.QLabel("Desired amplitude setpoint (GUI units):"), r, 2, alignment=QtCore.Qt.AlignRight)
+        self.A_set = QtWidgets.QDoubleSpinBox(); self.A_set.setDecimals(6); self.A_set.setRange(0.0, 1e9); self.A_set.setValue(1.0); self.A_set.setMaximumWidth(130)
+        self.A_set.setToolTip("Amplitude Ref to apply (SXM interprets this number in the unit currently shown in its GUI).")
+        form.addWidget(self.A_set, r, 3)
+
+        r += 1
+        form.addWidget(QtWidgets.QLabel("Output gain (AFL):"), r, 0, alignment=QtCore.Qt.AlignRight)
+        self.gain = QtWidgets.QComboBox(); self.gain.addItems(["±0.1 V", "±1 V", "±10 V"]); self.gain.setCurrentIndex(1)
+        form.addWidget(self.gain, r, 1)
+
+        form.addWidget(QtWidgets.QLabel("Target PLL bandwidth (Hz):"), r, 2, alignment=QtCore.Qt.AlignRight)
+        self.bw = QtWidgets.QDoubleSpinBox(); self.bw.setDecimals(1); self.bw.setRange(0.1, 5000.0); self.bw.setValue(100.0); self.bw.setMaximumWidth(130)
+        self.bw.setToolTip("Lower BW → lower df noise but slower tracking. Adjust with scan speed. (Manual note)")
+        form.addWidget(self.bw, r, 3)
+
+        layout.addWidget(box)
+
+        # ---- Buttons
+        btns = QtWidgets.QHBoxLayout()
+        self.calc_btn = QtWidgets.QPushButton("Suggest")
+        self.calc_btn.clicked.connect(self.calculate_suggestions)
+        btns.addWidget(self.calc_btn)
+
+        self.apply_btn = QtWidgets.QPushButton("Apply Suggested")
+        self.apply_btn.clicked.connect(self.apply_suggestions)
+        btns.addWidget(self.apply_btn)
+
+        btns.addStretch()
+        layout.addLayout(btns)
+
+        # ---- Suggestions table
+        self.table = QtWidgets.QTableWidget(6, 2)
+        self.table.setHorizontalHeaderLabels(["Parameter", "Suggested Value"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+
+        labels = ["Amplitude Ki", "Amplitude Kp", "Amplitude Ref (GUI unit)", "PLL Ki", "PLL Kp", "Used Frequency (GUI unit)"]
+        for i, lbl in enumerate(labels):
+            item = QtWidgets.QTableWidgetItem(lbl)
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.table.setItem(i, 0, item)
+            self.table.setItem(i, 1, QtWidgets.QTableWidgetItem("—"))
+
+        # Tooltips for unit‑sensitive values
+        for row in [2, 5]:
+            self.table.item(row, 0).setToolTip("⚠ Interpreted in the CURRENT unit shown in SXM.")
+            self.table.item(row, 1).setToolTip("⚠ Interpreted in the CURRENT unit shown in SXM.")
+        layout.addWidget(self.table)
+
+        # Info text (tiny)
+        note = QtWidgets.QLabel("Notes: AFL starts with manual rule‑of‑thumb from SXM manual; PLL gains are conservative seeds to refine with your Step Test (+/−1 Hz on Used Frequency).")
+        note.setStyleSheet("color: #555;")
+        layout.addWidget(note)
+
+        # Pre-fill with initial calculation
+        self.calculate_suggestions()
+
+    # ---- helpers
+    def _gain_scale(self):
+        txt = self.gain.currentText()
+        # Manual: changing from ±1 V → ±0.1 V → multiply Ki & Kp by 10; ±10 V → divide by 10. (scale ∝ 1/gain)
+        if "±0.1" in txt:
+            return 10.0
+        if "±10" in txt:
+            return 0.1
+        return 1.0  # ±1 V
+
+    def calculate_suggestions(self):
+        f0  = float(self.f0.value())
+        Q   = max(float(self.Q.value()), 1.0)
+        Af  = float(self.A_free.value())
+        As  = float(self.A_set.value())
+        gsf = self._gain_scale()
+
+        # AFL from manual @ ±1V, then scale by output gain
+        amp_ki = (5e8 / Q) * gsf
+        amp_kp = (5e12 / Q) * gsf
+
+        # PLL conservative seeds (refine with Step Test)
+        pll_kp = max(0.1, min(5.0, 5e4 / Q))
+        pll_ki = pll_kp / 10.0
+
+        used_f = f0  # initial PLL "use" frequency
+
+        values = [amp_ki, amp_kp, As, pll_ki, pll_kp, used_f]
+        for i, v in enumerate(values):
+            self.table.item(i, 1).setText(f"{v:.6g}")
+
+    def _get_table_value(self, row):
+        try:
+            return float(self.table.item(row, 1).text())
+        except Exception:
+            return None
+
+    def apply_suggestions(self):
+        # Read back current suggestions
+        amp_ki  = self._get_table_value(0)
+        amp_kp  = self._get_table_value(1)
+        amp_ref = self._get_table_value(2)
+        pll_ki  = self._get_table_value(3)
+        pll_kp  = self._get_table_value(4)
+        used_f  = self._get_table_value(5)
+
+        # Write through the existing write_param(...) helper
+        try:
+            if amp_ki is not None:
+                write_param(self.dde, *self.key_to_code["amp_ki"],  amp_ki)
+            if amp_kp is not None:
+                write_param(self.dde, *self.key_to_code["amp_kp"],  amp_kp)
+            if amp_ref is not None:
+                write_param(self.dde, *self.key_to_code["amp_ref"], amp_ref)
+            if pll_ki is not None:
+                write_param(self.dde, *self.key_to_code["pll_ki"],  pll_ki)
+            if pll_kp is not None:
+                write_param(self.dde, *self.key_to_code["pll_kp"],  pll_kp)
+            if used_f is not None:
+                # Wizard uses true DNC for used frequency (write-only)
+                # If your PARAMS contains "used_freq" (DNC,3), use that; else fall back to freq_ref Edit15.
+                if "used_freq" in self.key_to_code:
+                    write_param(self.dde, *self.key_to_code["used_freq"], used_f)
+                else:
+                    # fallback to GUI field if you prefer: Edit15
+                    write_param(self.dde, "EDIT", "Edit15", used_f)
+
+            QtWidgets.QMessageBox.information(self, "Apply Suggested", "Suggested values sent.")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Apply Suggested", f"Failed to send one or more values:\n{e}")
 
 # ---------------- Main Window ----------------
 class MainWindow(QtWidgets.QTabWidget):
@@ -348,7 +516,8 @@ class MainWindow(QtWidgets.QTabWidget):
         self.step_tab = StepTestTab(dde_client)
         self.addTab(self.table_tab, "Parameters")
         self.addTab(self.step_tab, "Step Test")
-
+        self.wizard_tab = SetupWizardTab(dde_client)
+        self.addTab(self.wizard_tab, "ncAFM setup Wizard")
 # ---------------- Main ----------------
 def main():
     app = QtWidgets.QApplication(sys.argv)
