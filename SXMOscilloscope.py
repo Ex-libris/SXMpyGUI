@@ -393,7 +393,7 @@ class ScopeApp(QtWidgets.QMainWindow):
         self.setWindowTitle("SXM Scope — spectral SNR + PSD")
 
         # ---- Timing ----
-        self.sample_period_s       = 0.05   # ~20 Hz GUI/update
+        self.sample_period_s       = 0.002   # ~20 Hz GUI/update
         self.max_history_seconds   = 600
         self.time_window_options_s = [1, 5, 10, 30, 60, 120, 600]
         self.max_history_samples   = int(self.max_history_seconds / self.sample_period_s) + 2

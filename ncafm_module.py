@@ -480,7 +480,7 @@ class StepTestTab(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QWidget):
     def __init__(self, dde_client):
         super().__init__()
-        self.setWindowTitle("NC-AFM Control Suite (write-only, EDIT + DNC, custom EditXX)")
+        self.setWindowTitle("NC-AFM Control")
         self.resize(980, 620)
 
         v = QtWidgets.QVBoxLayout(self)
