@@ -1,152 +1,267 @@
-"""
-NC-AFM Control Suite (Production)
-
-- Single-window GUI to read/write NC‑AFM parameters via the official SXM DDE API.
-- Production-only: relies on SXMRemote.DDEClient; no mock or shadow functions.
-- Parameters tab:
-    * Columns: Parameter | Edit Code | Previous | Current | New Value
-    * Previous and Current are grouped readouts (light gray).
-    * New Value is editable (light yellow), with Auto-Send and Apply Selected.
-    * Collapsible change log with timestamps.
-- Step Test tab:
-    * Symbolic square-wave preview for a chosen parameter (no live measurement yet).
-    * Timed Start applies alternating low/high steps every period for N steps.
-    * Run log shows each value sent with timestamps.
-
-Author: (your lab)
-"""
-
-from __future__ import annotations
-
 import sys
 import datetime
-from typing import List, Tuple
-
 from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
-import SXMRemote  # Production module: provides DDEClient and methods
 
+# ---------- Slim, context-aware safety warning (used as a footer now) ----------
+SHORT_WARNING_TEXT = (
+    "⚠ Check SXM units & never exceed ±10 V without attenuation."
+)
 
-# -----------------------------------------------------------------------------
-# Configuration: map friendly keys -> (EditXX, Friendly Label)
-# -----------------------------------------------------------------------------
-PARAM_DEFINITIONS: List[Tuple[str, str, str]] = [
-    ("amp_ki",  "Edit24",  "Amplitude Ki"),
-    ("amp_kp",  "Edit32",  "Amplitude Kp"),
-    ("pll_kp",  "Edit27",  "PLL Kp"),
-    ("pll_ki",  "Edit22",  "PLL Ki"),
-    ("amp_ref", "Edit23",  "Amplitude Ref"),
-    ("freq_ref","Edit15",  "Frequency Ref"),
-]
+LONG_WARNING_HTML = (
+    "<b>Units matter:</b> SXM interprets numbers in the <b>current</b> GUI units "
+    "(Hz/kHz, V/mV/µV, nm/pm, etc.). Verify the unit shown in SXM before sending.<br>"
+    "<b>Voltage safety:</b> Do <b>not</b> exceed ±10 V at the output unless a hardware divider/attenuator is in place.<br>"
+    "Step Test sends exactly the values you enter — verify LOW/HIGH against the current unit."
+)
 
-PARAM_TOOLTIPS = {
-    "amp_ki":  "Integral gain of the amplitude feedback loop.\n"
-               "Integrates amplitude error to remove long-term offsets.",
-    "amp_kp":  "Proportional gain of the amplitude feedback loop.\n"
-               "Acts directly on the instantaneous amplitude error.",
-    "pll_kp":  "Proportional gain of the PLL loop controlling oscillation frequency.\n"
-               "Higher Kp speeds phase correction but can increase noise.",
-    "pll_ki":  "Integral gain of the PLL loop.\n"
-               "Eliminates steady frequency offsets by integrating phase error.",
-    "amp_ref": "Target oscillation amplitude (setpoint).\n"
-               "Amplitude loop adjusts drive to maintain this value.",
-    "freq_ref":"Target oscillation frequency for the PLL to track.\n"
-               "PLL locks measured frequency to this reference.",
+def make_warning_strip(parent=None):
+    """Compact, expandable warning strip (we'll place it as a global footer)."""
+    container = QtWidgets.QWidget(parent)
+    h = QtWidgets.QHBoxLayout(container)
+    h.setContentsMargins(8, 6, 8, 6)
+    h.setSpacing(8)
+
+    icon = QtWidgets.QLabel("⚠", container)
+    icon.setStyleSheet("font-size: 13pt;")
+    h.addWidget(icon, 0, QtCore.Qt.AlignVCenter)
+
+    msg = QtWidgets.QLabel(SHORT_WARNING_TEXT, container)
+    msg.setStyleSheet("color:#6b5900; font-size: 10.5pt;")
+    h.addWidget(msg, 1, QtCore.Qt.AlignVCenter)
+
+    details_btn = QtWidgets.QToolButton(container)
+    details_btn.setText("Details")
+    details_btn.setCheckable(True)
+    details_btn.setStyleSheet(
+        "QToolButton { padding:2px 6px; border:1px solid #e6d9a2; border-radius:4px; background:#fff7da; }"
+        "QToolButton:checked { background:#ffeeb7; }"
+    )
+    h.addWidget(details_btn, 0, QtCore.Qt.AlignVCenter)
+
+    # hidden details popover
+    details = QtWidgets.QTextBrowser(container)
+    details.setHtml(LONG_WARNING_HTML)
+    details.setOpenExternalLinks(True)
+    details.setStyleSheet(
+        "QTextBrowser { background:#fffaf0; border:1px solid #e6d9a2; border-radius:6px; padding:6px; color:#6b5900; }"
+    )
+    details.hide()
+
+    # stack the strip and the details vertically
+    wrapper = QtWidgets.QWidget(parent)
+    v = QtWidgets.QVBoxLayout(wrapper)
+    v.setContentsMargins(0, 0, 0, 0)
+    v.setSpacing(6)
+    v.addWidget(container)
+    v.addWidget(details)
+
+    def toggle_details(on):
+        details.setVisible(on)
+    details_btn.toggled.connect(toggle_details)
+
+    # border + background for the strip only (not the expanded details)
+    container.setStyleSheet(
+        "QWidget { background:#fff7da; border:1px solid #e6d9a2; border-radius:6px; }"
+    )
+    wrapper.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
+    return wrapper
+
+# ---------------- Canonical parameter registry ----------------
+# ptype: "EDIT" -> ScanPara('EditXX', v) | "DNC" -> DNCPara(n, v)
+PARAMS_CORE = {
+    "amp_ki":    ("EDIT", "Edit24",  "Amplitude Ki"),
+    "amp_kp":    ("EDIT", "Edit32",  "Amplitude Kp"),
+    "pll_kp":    ("EDIT", "Edit27",  "PLL Kp"),
+    "pll_ki":    ("EDIT", "Edit22",  "PLL Ki"),
+    "amp_ref":   ("EDIT", "Edit23",  "Amplitude Ref"),
+    # Removed: "freq_ref": ("EDIT", "Edit15", "Frequency Ref"),
+    "used_freq": ("DNC",  3,         "Used Frequency (f0)"),
+    "drive":     ("DNC",  4,         "Drive"),
 }
 
+EDIT_SIGNALS = {
+    "amp_ki":  "Edit24",
+    "amp_kp":  "Edit32",
+    "pll_kp":  "Edit27",
+    "pll_ki":  "Edit22",
+    "amp_ref": "Edit23",
+    # "freq_ref": "Edit15",  # removed
+}
 
-# =============================================================================
-# Tab 1: Parameters
-# =============================================================================
-class ParametersTab(QtWidgets.QWidget):
-    """
-    Parameters editor tab.
+DNC_SIGNALS = {
+    "used_freq": 3,   # f0 via DNC
+    "drive":     4,
+}
 
-    - Reads 'Current' values from the instrument via SXMRemote.DDEClient.GetScanPara(EditXX).
-    - Writes 'New Value' via SXMRemote.DDEClient.SendWait("ScanPara('EditXX', value);").
-    - 'Previous' stores the last 'Current' before a successful write, for quick comparison.
-    """
+CUSTOM_PARAMS = []  # list of (key, (ptype,pcode), label)
 
-    REFRESH_MS = 1000  # periodic refresh of Current values
+UNIT_NOTE = "\n⚠ The value is interpreted in the current unit displayed in the SXM software."
+PARAM_DESCRIPTIONS = {
+    "amp_ki":   "Integral gain of the amplitude feedback loop (NC-AFM).\nIntegrates amplitude error to correct slow drifts.",
+    "amp_kp":   "Proportional gain of the amplitude loop.\nHigher Kp reacts faster but can introduce oscillations.",
+    "pll_kp":   "Proportional gain of the PLL (frequency control).\nHigher Kp speeds phase correction but can add noise.",
+    "pll_ki":   "Integral gain of the PLL.\nRemoves residual phase/frequency offsets slowly.",
+    "amp_ref":  "Target oscillation amplitude setpoint." + UNIT_NOTE,
+    "used_freq":"PLL used frequency (controller ‘Use Freq’, DNC=3) — actual f₀." + UNIT_NOTE,
+    "drive":    "Drive amplitude used to maintain oscillation (DNC=4)." + UNIT_NOTE,
+}
 
-    def __init__(self, dde_client: SXMRemote.DDEClient, parent: QtWidgets.QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.dde_client = dde_client
+# ---------------- Write-only cache ----------------
+def code_id(ptype, pcode):
+    return f"{ptype}:{pcode}"
 
-        outer = QtWidgets.QVBoxLayout(self)
+LAST_WRITTEN = {code_id(*PARAMS_CORE[k][:2]): None for k in PARAMS_CORE}
 
-        # --- Toolbar ---
+# ---------------- Guardrail helpers ----------------
+VOLTAGE_LIMIT_ABS = 10.0  # ±10 V guard
+
+def is_voltage_like(ptype, pcode):
+    """Return True for parameters that represent voltages at the output stage."""
+    # Amplitude Ref (Edit23) and Drive (DNC 4) are voltage-like in typical setups
+    return (ptype == "EDIT" and str(pcode).lower() == "edit23") or (ptype == "DNC" and int(pcode) == 4)
+
+def confirm_voltage_send(parent, ptype, pcode, value):
+    """If sending a voltage-like value above ±10 V, ask for confirmation."""
+    try:
+        v = float(value)
+    except Exception:
+        return True  # non-numeric handled elsewhere; don't block here
+    if is_voltage_like(ptype, pcode) and abs(v) > VOLTAGE_LIMIT_ABS:
+        code_txt = pcode if ptype == "EDIT" else f"DNC{pcode}"
+        m = QtWidgets.QMessageBox(parent)
+        m.setIcon(QtWidgets.QMessageBox.Warning)
+        m.setWindowTitle("Confirm High Voltage")
+        m.setText(
+            f"You are about to send {v} to <b>{code_txt}</b>.\n\n"
+            "⚠ SXM interprets values in the <b>current GUI unit</b> (V/mV/µV).\n"
+            f"⚠ Do <b>not</b> exceed ±{VOLTAGE_LIMIT_ABS} V at the output unless a divider/attenuator is in place.\n\n"
+            "Proceed?"
+        )
+        m.setStandardButtons(QtWidgets.QMessageBox.Cancel | QtWidgets.QMessageBox.Ok)
+        m.setDefaultButton(QtWidgets.QMessageBox.Cancel)
+        return m.exec_() == QtWidgets.QMessageBox.Ok
+    return True
+
+# ---------------- Mock DDE (offline testing) ----------------
+class MockDDEClient:
+    def __init__(self):
+        self.cache = dict(LAST_WRITTEN)
+
+    def SendWait(self, cmd: str):
+        c = cmd.strip().rstrip(";")
+        try:
+            if c.startswith("ScanPara("):
+                inner = c[len("ScanPara("):-1] if c.endswith(")") else c[len("ScanPara("):]
+                edit, val = inner.split(",", 1)
+                edit = edit.strip().strip("'\"")
+                val = float(val)
+                self.cache[f"EDIT:{edit}"] = val
+                LAST_WRITTEN[f"EDIT:{edit}"] = val
+                print(f"[MOCK] ScanPara set {edit} = {val}")
+            elif c.startswith("DNCPara("):
+                inner = c[len("DNCPara("):-1] if c.endswith(")") else c[len("DNCPara("):]
+                n, val = inner.split(",", 1)
+                n = int(n.strip())
+                val = float(val)
+                self.cache[f"DNC:{n}"] = val
+                LAST_WRITTEN[f"DNC:{n}"] = val
+                print(f"[MOCK] DNCPara set {n} = {val}")
+            else:
+                print(f"[MOCK] Unknown command: {cmd}")
+        except Exception as e:
+            print(f"[MOCK] Failed to parse: {cmd} -> {e}")
+
+# ---------------- Write helpers ----------------
+def write_param(dde, ptype, pcode, value: float, parent=None):
+    """Route write and update cache, with guardrail confirmation for voltage-like params."""
+    if not confirm_voltage_send(parent, ptype, pcode, value):
+        return  # user cancelled
+
+    if ptype == "EDIT":
+        dde.SendWait(f"ScanPara('{pcode}', {value});")
+    elif ptype == "DNC":
+        dde.SendWait(f"DNCPara({pcode}, {value});")
+    else:
+        raise ValueError(f"Unknown param type: {ptype}")
+    LAST_WRITTEN[code_id(ptype, pcode)] = float(value)
+
+def read_cached(ptype, pcode):
+    return LAST_WRITTEN.get(code_id(ptype, pcode), None)
+
+# ---------------- Tab 1: Parameters (table) ----------------
+class ParamTable(QtWidgets.QWidget):
+    custom_added = QtCore.pyqtSignal()
+
+    def __init__(self, dde_client):
+        super().__init__()
+        self.dde = dde_client
+        layout = QtWidgets.QVBoxLayout(self)
+
         toolbar = QtWidgets.QHBoxLayout()
-        outer.addLayout(toolbar)
+        layout.addLayout(toolbar)
 
-        self.apply_selected_button = QtWidgets.QPushButton("Apply Selected")
-        self.apply_selected_button.setToolTip("Send all edited 'New Value' cells in the selected rows.")
-        self.apply_selected_button.clicked.connect(self.apply_selected_rows)
-        toolbar.addWidget(self.apply_selected_button)
+        self.apply_btn = QtWidgets.QPushButton("Apply Selected")
+        self.apply_btn.clicked.connect(self.apply_selected)
+        toolbar.addWidget(self.apply_btn)
 
-        self.auto_send_checkbox = QtWidgets.QCheckBox("Auto-Send on Edit")
-        self.auto_send_checkbox.setToolTip("If enabled, pressing Enter in a 'New Value' cell immediately writes it.")
-        toolbar.addWidget(self.auto_send_checkbox)
+        self.auto_send_chk = QtWidgets.QCheckBox("Auto-Send on Edit")
+        toolbar.addWidget(self.auto_send_chk)
 
-        self.toggle_log_button = QtWidgets.QPushButton("Show Change Log")
-        self.toggle_log_button.setCheckable(True)
-        self.toggle_log_button.toggled.connect(self._toggle_log_visibility)
-        toolbar.addWidget(self.toggle_log_button)
+        self.add_custom_btn = QtWidgets.QPushButton("Add Custom EditXX…")
+        self.add_custom_btn.clicked.connect(self.add_custom_param)
+        toolbar.addWidget(self.add_custom_btn)
+
+        self.toggle_log_btn = QtWidgets.QPushButton("Show Change Log")
+        self.toggle_log_btn.setCheckable(True)
+        self.toggle_log_btn.toggled.connect(self.toggle_log)
+        toolbar.addWidget(self.toggle_log_btn)
 
         toolbar.addStretch()
 
-        # --- Table ---
-        self.table = QtWidgets.QTableWidget(len(PARAM_DEFINITIONS), 5)
+        self.table = QtWidgets.QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
-            ["Parameter", "Edit Code", "Previous", "Current", "New Value"]
+            ["Parameter", "Code", "Previous", "Current", "New Value"]
         )
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        outer.addWidget(self.table)
+        layout.addWidget(self.table)
 
-        # Fill rows
-        for row, (key, edit_code, label) in enumerate(PARAM_DEFINITIONS):
-            # Parameter name with tooltip (read-only)
-            name_item = QtWidgets.QTableWidgetItem(label)
-            name_item.setToolTip(PARAM_TOOLTIPS[key])
-            name_item.setFlags(name_item.flags() & ~QtCore.Qt.ItemIsEditable)
-            self.table.setItem(row, 0, name_item)
+        self.log_widget = QtWidgets.QTextEdit()
+        self.log_widget.setReadOnly(True)
+        self.log_widget.hide()
+        layout.addWidget(self.log_widget)
 
-            # Edit code (read-only)
-            self._set_cell(row, 1, edit_code, editable=False, bg=None)
+        self.table.cellChanged.connect(self.on_cell_changed)
+        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Return"), self, self.apply_selected)
 
-            # Previous (read-only, grouped gray)
-            self._set_cell(row, 2, "", editable=False, bg=QtGui.QColor("#e0e0e0"))
+        self._rebuild_table()
 
-            # Current (read-only, grouped gray)
-            self._set_cell(row, 3, "", editable=False, bg=QtGui.QColor("#e0e0e0"))
+    def _all_params_list(self):
+        core = [(k, PARAMS_CORE[k][:2], PARAMS_CORE[k][2]) for k in PARAMS_CORE]
+        custom = CUSTOM_PARAMS[:]
+        return core + custom
 
-            # New Value (editable, yellow)
-            self._set_cell(row, 4, "", editable=True, bg=QtGui.QColor("#fff8dc"))
+    def _row_param(self, row):
+        return self._all_params_list()[row]
 
-        # --- Collapsible log ---
-        self.change_log = QtWidgets.QTextEdit()
-        self.change_log.setReadOnly(True)
-        self.change_log.hide()
-        outer.addWidget(self.change_log)
+    def _rebuild_table(self):
+        rows = self._all_params_list()
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(rows))
+        for row, (key, (ptype, pcode), label) in enumerate(rows):
+            p_item = QtWidgets.QTableWidgetItem(label)
+            p_item.setToolTip(PARAM_DESCRIPTIONS.get(key, ""))
+            p_item.setFlags(p_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.table.setItem(row, 0, p_item)
+            code_text = pcode if ptype == "EDIT" else f"DNC{pcode}"
+            self._set_item(row, 1, code_text, False, None)
+            self._set_item(row, 2, "—", False, QtGui.QColor("#e0e0e0"))
+            cur = read_cached(ptype, pcode)
+            self._set_item(row, 3, "—" if cur is None else str(cur), False, QtGui.QColor("#e0e0e0"))
+            self._set_item(row, 4, "", True, QtGui.QColor("#fff8dc"))
+        self.table.blockSignals(False)
 
-        # Signals
-        self.table.cellChanged.connect(self._on_cell_changed)
-
-        # Periodic refresh of 'Current'
-        self._refresh_timer = QtCore.QTimer(self)
-        self._refresh_timer.timeout.connect(self.refresh_current_values)
-        self._refresh_timer.start(self.REFRESH_MS)
-
-        # Initial population of Previous/Current
-        self.refresh_current_values(first_load=True)
-
-        # Keyboard shortcut for batch apply
-        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Return"), self, self.apply_selected_rows)
-
-    # ---------- UI helpers ----------
-
-    def _set_cell(self, row: int, col: int, text: str, *, editable: bool, bg: QtGui.QColor | None) -> None:
-        """Create or update a table cell."""
+    def _set_item(self, row, col, text, editable, bg):
         item = QtWidgets.QTableWidgetItem(str(text))
         if not editable:
             item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
@@ -154,348 +269,252 @@ class ParametersTab(QtWidgets.QWidget):
             item.setBackground(bg)
         self.table.setItem(row, col, item)
 
-    # ---------- DDE I/O ----------
-
-    def refresh_current_values(self, *, first_load: bool = False) -> None:
-        """
-        Refresh 'Current' from the device using GetScanPara(EditXX).
-        If first_load=True, also copy Current -> Previous so the table starts consistent.
-        """
-        for row, (_key, edit_code, _label) in enumerate(PARAM_DEFINITIONS):
+    def on_cell_changed(self, row, col):
+        if col != 4:
+            return
+        if self.auto_send_chk.isChecked():
             try:
-                value = self.dde_client.GetScanPara(edit_code)
-            except Exception:
-                value = None
+                new_val = float(self.table.item(row, col).text())
+            except ValueError:
+                return
+            self.apply_row(row, new_val)
 
-            if value is None:
-                # Show error but keep table stable
-                self.table.item(row, 3).setText("Err")
-                if first_load:
-                    self.table.item(row, 2).setText("Err")
-            else:
-                self.table.item(row, 3).setText(str(value))
-                if first_load:
-                    self.table.item(row, 2).setText(str(value))
-
-    def _write_parameter(self, edit_code: str, new_value: float) -> None:
-        """
-        Write a parameter using the official syntax used in setParasByComponentName.py:
-            SendWait("ScanPara('EditXX', value);")
-        """
-        self.dde_client.SendWait(f"ScanPara('{edit_code}', {new_value});")
-
-    # ---------- Actions ----------
-
-    def _on_cell_changed(self, row: int, col: int) -> None:
-        """
-        Triggered when a cell changes. If the edited cell is 'New Value' and
-        'Auto-Send on Edit' is enabled, send immediately.
-        """
-        NEW_VALUE_COL = 4
-        if col != NEW_VALUE_COL:
-            return
-        if not self.auto_send_checkbox.isChecked():
-            return
-
+    def apply_row(self, row, new_val):
+        key, (ptype, pcode), label = self._row_param(row)
+        prev_val_text = self.table.item(row, 3).text()
+        self.table.item(row, 2).setText(prev_val_text)
         try:
-            target_value = float(self.table.item(row, NEW_VALUE_COL).text())
-        except (TypeError, ValueError):
-            return  # Ignore invalid numeric input
+            write_param(self.dde, ptype, pcode, new_val, parent=self)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "DDE Send Error",
+                                          f"Failed to send {ptype}:{pcode} = {new_val}\n\n{e}")
+            return
+        self.table.item(row, 3).setText(str(new_val))
+        self.table.item(row, 3).setBackground(QtGui.QColor("#fff2b3"))
+        QtCore.QTimer.singleShot(900, lambda: self.table.item(row, 3).setBackground(QtGui.QColor("#e0e0e0")))
+        self.log_change(row, prev_val_text, new_val)
 
-        self.apply_single_row(row, target_value)
-
-    def apply_single_row(self, row: int, target_value: float) -> None:
-        """
-        Apply a single row change:
-          - Set 'Previous' = last 'Current'
-          - Write via DDE
-          - Check readback and flash green/red
-          - Log the change
-        """
-        EDIT_CODE_COL, PREV_COL, CURR_COL, NEW_COL = 1, 2, 3, 4
-
-        edit_code = self.table.item(row, EDIT_CODE_COL).text()
-        last_current_text = self.table.item(row, CURR_COL).text()
-        self.table.item(row, PREV_COL).setText(last_current_text)
-
-        # Write to device
-        self._write_parameter(edit_code, target_value)
-
-        # Short delay then verify
-        QtCore.QTimer.singleShot(500, lambda: self._verify_and_flash(row, target_value))
-        self._append_log(row, old_value=last_current_text, new_value=target_value)
-
-    def apply_selected_rows(self) -> None:
-        """Apply all edited 'New Value' cells in the selected rows."""
-        NEW_VALUE_COL = 4
-        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+    def apply_selected(self):
+        rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
         for row in rows:
             try:
-                target_value = float(self.table.item(row, NEW_VALUE_COL).text())
-            except (TypeError, ValueError):
+                new_val = float(self.table.item(row, 4).text())
+            except ValueError:
                 continue
-            self.apply_single_row(row, target_value)
+            self.apply_row(row, new_val)
 
-    # ---------- Feedback & Logging ----------
-
-    def _verify_and_flash(self, row: int, expected_value: float) -> None:
-        """
-        Re-read 'Current' and flash the cell:
-          - Green if equals the expected value
-          - Red otherwise
-        Then restore the normal gray background and refresh the 'Current' column.
-        """
-        CURR_COL = 3
-        edit_code = self.table.item(row, 1).text()
-
-        try:
-            readback = self.dde_client.GetScanPara(edit_code)
-        except Exception:
-            readback = None
-
-        if readback is not None and float(readback) == float(expected_value):
-            color = QtGui.QColor("#a8e6a3")  # success
-        else:
-            color = QtGui.QColor("#f4a6a6")  # mismatch
-
-        self.table.item(row, CURR_COL).setBackground(color)
-        QtCore.QTimer.singleShot(
-            900, lambda: self.table.item(row, CURR_COL).setBackground(QtGui.QColor("#e0e0e0"))
-        )
-        self.refresh_current_values(first_load=False)
-
-    def _append_log(self, row: int, *, old_value: str, new_value: float) -> None:
-        """Append a timestamped entry to the change log."""
+    def log_change(self, row, prev_val, new_val):
         label = self.table.item(row, 0).text()
-        edit_code = self.table.item(row, 1).text()
+        code = self.table.item(row, 1).text()
         ts = datetime.datetime.now().strftime("%H:%M:%S")
-        self.change_log.append(f"[{ts}] {label} ({edit_code}): {old_value} → {new_value}")
+        self.log_widget.append(f"[{ts}] {label} ({code}): {prev_val} → {new_val}")
 
-    def _toggle_log_visibility(self, show: bool) -> None:
-        """Show or hide the change log panel."""
-        self.change_log.setVisible(show)
-        self.toggle_log_button.setText("Hide Change Log" if show else "Show Change Log")
+    def toggle_log(self, show):
+        self.log_widget.setVisible(show)
+        self.toggle_log_btn.setText("Hide Change Log" if show else "Show Change Log")
 
+    def add_custom_param(self):
+        edit_code, ok = QtWidgets.QInputDialog.getText(self, "Add Custom EditXX", "Enter component code (e.g., Edit37):")
+        if not ok or not edit_code.strip():
+            return
+        edit_code = edit_code.strip()
+        if not (edit_code.startswith("Edit") and edit_code[4:].isdigit()):
+            QtWidgets.QMessageBox.warning(self, "Invalid", "Please enter a valid code like Edit37.")
+            return
+        label, ok = QtWidgets.QInputDialog.getText(self, "Label", "Enter a label to show:")
+        if not ok or not label.strip():
+            return
+        label = label.strip()
+        existing_keys = set(PARAMS_CORE.keys()).union({k for (k, _, _) in CUSTOM_PARAMS})
+        base_key = f"user_{edit_code.lower()}"
+        key = base_key
+        i = 1
+        while key in existing_keys:
+            i += 1
+            key = f"{base_key}_{i}"
+        CUSTOM_PARAMS.append((key, ("EDIT", edit_code), label))
+        LAST_WRITTEN.setdefault(code_id("EDIT", edit_code), None)
+        self._rebuild_table()
+        self.custom_added.emit()
 
-# =============================================================================
-# Tab 2: Step Test (symbolic preview + timed sending)
-# =============================================================================
+# ---------------- Tab 2: Step Test (symbolic + send + stop) ----------------
 class StepTestTab(QtWidgets.QWidget):
-    """
-    Step Test tab.
+    def __init__(self, dde_client):
+        super().__init__()
+        self.dde = dde_client
+        self.timer = None
+        self.step_index = 0
+        layout = QtWidgets.QVBoxLayout(self)
 
-    - PREVIEW: Draws a symbolic square wave of the planned steps (no live measurement).
-    - START: Sends alternating low/high values to the chosen parameter every 'period'
-      seconds, for 'steps' steps, using:
-          SendWait("ScanPara('EditXX', value);")
-    - A run log records each set action with a timestamp.
-    """
+        # Controls grid
+        ctrl_widget = QtWidgets.QWidget()
+        ctrl = QtWidgets.QGridLayout(ctrl_widget)
+        ctrl.setContentsMargins(8, 6, 8, 6)
+        ctrl.setHorizontalSpacing(12)
+        ctrl.setVerticalSpacing(6)
 
-    def __init__(self, dde_client: SXMRemote.DDEClient, parent: QtWidgets.QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.dde_client = dde_client
-        self._step_index = 0
-        self._timer: QtCore.QTimer | None = None
+        self.param_combo = QtWidgets.QComboBox()
+        self.refresh_param_list()
+        self.param_combo.setMinimumWidth(200)
 
-        # ----- Layout skeleton -----
-        outer = QtWidgets.QVBoxLayout(self)
-
-        # Controls (fixed spacing; non-stretch)
-        controls_widget = QtWidgets.QWidget()
-        controls = QtWidgets.QGridLayout(controls_widget)
-        controls.setContentsMargins(8, 6, 8, 6)
-        controls.setHorizontalSpacing(12)
-        controls.setVerticalSpacing(6)
-
-        # Parameter selector
-        self.parameter_combo = QtWidgets.QComboBox()
-        for key, edit_code, label in PARAM_DEFINITIONS:
-            self.parameter_combo.addItem(label, (key, edit_code))
-        self.parameter_combo.setMinimumWidth(160)
-
-        r, c = 0, 0
-        controls.addWidget(self.parameter_combo, r, c, 1, 2); c += 2
-
-        # Helpers for labels
-        def right_label(text: str) -> QtWidgets.QLabel:
-            lab = QtWidgets.QLabel(text)
-            lab.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-            return lab
-
-        # Low / High
-        controls.addWidget(right_label("Low:"), r, c); c += 1
-        self.low_value = QtWidgets.QDoubleSpinBox()
-        self.low_value.setDecimals(4); self.low_value.setMaximum(1e12); self.low_value.setValue(100.0)
-        self.low_value.setFixedWidth(110)
-        controls.addWidget(self.low_value, r, c); c += 1
-
-        controls.addWidget(right_label("High:"), r, c); c += 1
-        self.high_value = QtWidgets.QDoubleSpinBox()
-        self.high_value.setDecimals(4); self.high_value.setMaximum(1e12); self.high_value.setValue(120.0)
-        self.high_value.setFixedWidth(110)
-        controls.addWidget(self.high_value, r, c); c += 1
-
-        # Period / Steps
-        controls.addWidget(right_label("Period (s):"), r, c); c += 1
-        self.step_period = QtWidgets.QDoubleSpinBox()
-        self.step_period.setDecimals(2); self.step_period.setMaximum(3600); self.step_period.setValue(5.0)
-        self.step_period.setFixedWidth(80)
-        controls.addWidget(self.step_period, r, c); c += 1
-
-        controls.addWidget(right_label("Steps:"), r, c); c += 1
-        self.num_steps = QtWidgets.QSpinBox()
-        self.num_steps.setMaximum(10000); self.num_steps.setValue(20)
-        self.num_steps.setFixedWidth(70)
-        controls.addWidget(self.num_steps, r, c); c += 1
-
-        # Buttons
-        self.preview_button = QtWidgets.QPushButton("Preview")
-        self.preview_button.setFixedWidth(90)
-        self.preview_button.clicked.connect(self.preview_pattern)
-        controls.addWidget(self.preview_button, r, c); c += 1
-
-        self.start_button = QtWidgets.QPushButton("Start")
-        self.start_button.setFixedWidth(90)
-        self.start_button.clicked.connect(self.start_test)
-        controls.addWidget(self.start_button, r, c)
-
-        outer.addWidget(controls_widget)
+        row = 0; col = 0
+        ctrl.addWidget(self.param_combo, row, col, 1, 2); col += 2
+        low_lbl = QtWidgets.QLabel("Low:"); low_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        ctrl.addWidget(low_lbl, row, col); col += 1
+        self.low_val = QtWidgets.QDoubleSpinBox(); self.low_val.setDecimals(6); self.low_val.setMaximum(1e12); self.low_val.setValue(100.0); self.low_val.setFixedWidth(120)
+        ctrl.addWidget(self.low_val, row, col); col += 1
+        high_lbl = QtWidgets.QLabel("High:"); high_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        ctrl.addWidget(high_lbl, row, col); col += 1
+        self.high_val = QtWidgets.QDoubleSpinBox(); self.high_val.setDecimals(6); self.high_val.setMaximum(1e12); self.high_val.setValue(101.0); self.high_val.setFixedWidth(120)
+        ctrl.addWidget(self.high_val, row, col); col += 1
+        per_lbl = QtWidgets.QLabel("Period (s):"); per_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        ctrl.addWidget(per_lbl, row, col); col += 1
+        self.period = QtWidgets.QDoubleSpinBox(); self.period.setDecimals(3); self.period.setMaximum(3600); self.period.setValue(1.000); self.period.setFixedWidth(90)
+        ctrl.addWidget(self.period, row, col); col += 1
+        steps_lbl = QtWidgets.QLabel("Steps:"); steps_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        ctrl.addWidget(steps_lbl, row, col); col += 1
+        self.steps = QtWidgets.QSpinBox(); self.steps.setMaximum(1000000); self.steps.setValue(20); self.steps.setFixedWidth(90)
+        ctrl.addWidget(self.steps, row, col); col += 1
+        self.preview_btn = QtWidgets.QPushButton("Preview"); self.preview_btn.setFixedWidth(90)
+        self.preview_btn.clicked.connect(self.preview_pattern); ctrl.addWidget(self.preview_btn, row, col); col += 1
+        self.start_btn = QtWidgets.QPushButton("Start"); self.start_btn.setFixedWidth(90)
+        self.start_btn.clicked.connect(self.start_test); ctrl.addWidget(self.start_btn, row, col); col += 1
+        self.stop_btn = QtWidgets.QPushButton("Stop"); self.stop_btn.setFixedWidth(90)
+        self.stop_btn.clicked.connect(self.stop_test); self.stop_btn.setEnabled(False)
+        ctrl.addWidget(self.stop_btn, row, col)
+        layout.addWidget(ctrl_widget)
 
         # Plot (symbolic)
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground('w')
         axis_pen = pg.mkPen(color='k', width=1)
-        for name in ('bottom', 'left'):
-            axis = self.plot_widget.getAxis(name)
-            axis.setPen(axis_pen)
-            axis.setTextPen('k')
-            axis.setStyle(tickTextOffset=5, **{'tickFont': QtGui.QFont('', 10)})
+        for ax in ['bottom', 'left']:
+            self.plot_widget.getAxis(ax).setPen(axis_pen)
+            self.plot_widget.getAxis(ax).setTextPen('k')
+            self.plot_widget.getAxis(ax).setStyle(tickTextOffset=5, **{'tickFont': QtGui.QFont('', 10)})
+        plot_item = self.plot_widget.getPlotItem()
+        plot_item.layout.setContentsMargins(50, 10, 10, 40)
         self.plot_widget.setLabel('left', 'Value')
         self.plot_widget.setLabel('bottom', 'Time', units='s')
-        outer.addWidget(self.plot_widget)
+        layout.addWidget(self.plot_widget)
 
-        # Run log
-        self.run_log = QtWidgets.QTextEdit()
-        self.run_log.setReadOnly(True)
-        outer.addWidget(self.run_log)
+        self.log_output = QtWidgets.QTextEdit()
+        self.log_output.setReadOnly(True)
+        layout.addWidget(self.log_output)
 
-    # ----- Plot helpers -----
+    def _all_params_for_combo(self):
+        core = [(k, PARAMS_CORE[k][:2], PARAMS_CORE[k][2]) for k in PARAMS_CORE]
+        return core + CUSTOM_PARAMS[:]
 
-    def _frame_axes(self, low: float, high: float, period: float, steps: int) -> None:
-        """Set reasonable view ranges for the preview plot."""
-        self.plot_widget.setXRange(0, max(1.0, steps * period), padding=0.02)
+    def refresh_param_list(self):
+        cur_text = self.param_combo.currentText() if hasattr(self, "param_combo") and self.param_combo.count() else None
+        items = self._all_params_for_combo()
+        if hasattr(self, "param_combo"):
+            self.param_combo.blockSignals(True)
+            self.param_combo.clear()
+        for key, (ptype, pcode), label in items:
+            self.param_combo.addItem(label, (key, ptype, pcode, label))
+        if cur_text:
+            idx = self.param_combo.findText(cur_text, QtCore.Qt.MatchExactly)
+            if idx >= 0:
+                self.param_combo.setCurrentIndex(idx)
+        if hasattr(self, "param_combo"):
+            self.param_combo.blockSignals(False)
+
+    def _set_axis_ranges(self, low, high, period, steps):
+        self.plot_widget.setXRange(0, steps * period, padding=0.02)
         ymin, ymax = sorted([low, high])
-        span = max(1.0, abs(ymax - ymin))
-        margin = 0.05 * span
+        margin = 0.05 * max(1.0, abs(ymax - ymin))
         self.plot_widget.setYRange(ymin - margin, ymax + margin, padding=0.02)
 
-    # ----- Preview / Start logic -----
-
-    def preview_pattern(self) -> None:
-        """
-        Draw a symbolic square wave of the planned steps.
-        pyqtgraph stepMode=True requires len(x) == len(y) + 1 (x are edges, y are heights).
-        """
-        low = self.low_value.value()
-        high = self.high_value.value()
-        period = self.step_period.value()
-        steps = self.num_steps.value()
-
-        # Build edges (x) and heights (y): start at 0, add one edge per step.
+    def preview_pattern(self):
+        low = self.low_val.value()
+        high = self.high_val.value()
+        period = self.period.value()
+        steps = self.steps.value()
         x = [0.0]
         y = []
         for i in range(steps):
             x.append((i + 1) * period)
             y.append(low if (i % 2 == 0) else high)
-
         self.plot_widget.clear()
         self.plot_widget.plot(x, y, stepMode=True, pen=pg.mkPen('b', width=2))
-        self._frame_axes(low, high, period, steps)
+        self._set_axis_ranges(low, high, period, steps)
 
-    def start_test(self) -> None:
-        """
-        Start sending the planned low/high sequence at a fixed interval.
-        Does not wait for readback; keeps the preview plot visible.
-        """
+    def start_test(self):
         self.preview_pattern()
-        self._step_index = 0
-        self.start_button.setEnabled(False)
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.step_index = 0
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.perform_step)
+        self.timer.start(int(self.period.value() * 1000))
 
-        if self._timer is None:
-            self._timer = QtCore.QTimer(self)
-            self._timer.timeout.connect(self._perform_single_step)
+    def stop_test(self):
+        if self.timer and self.timer.isActive():
+            self.timer.stop()
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            self.log_output.append(f"[{ts}] Test stopped by user.")
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
 
-        self._timer.start(int(self.step_period.value() * 1000))
+    def perform_step(self):
+        key, ptype, pcode, label = self.param_combo.currentData()
+        low = self.low_val.value()
+        high = self.high_val.value()
+        value = low if self.step_index % 2 == 0 else high
+        try:
+            write_param(self.dde, ptype, pcode, value, parent=self)
+        except Exception as e:
+            self.log_output.append(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] SEND ERROR: {e}")
+            self.stop_test()
+            return
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        code_text = pcode if ptype == "EDIT" else f"DNC{pcode}"
+        self.log_output.append(f"[{ts}] Set {label} ({code_text}) to {value}")
+        self.step_index += 1
+        if self.step_index >= self.steps.value():
+            self.stop_test()
 
-    def _perform_single_step(self) -> None:
-        """Send one step value (low on even indices, high on odd) and log it."""
-        _, edit_code = self.parameter_combo.currentData()
-        low = self.low_value.value()
-        high = self.high_value.value()
-        value = low if (self._step_index % 2 == 0) else high
+# ---------------- Main Window (now a QWidget with tabs + footer) ----------------
+class MainWindow(QtWidgets.QWidget):
+    def __init__(self, dde_client):
+        super().__init__()
+        self.setWindowTitle("NC-AFM Control Suite (write-only, EDIT + DNC, custom EditXX)")
+        self.resize(980, 620)
 
-        # Production write using SXMRemote's syntax
-        self.dde_client.SendWait(f"ScanPara('{edit_code}', {value});")
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(8)
 
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        label = self.parameter_combo.currentText()
-        self.run_log.append(f"[{timestamp}] Set {label} ({edit_code}) to {value}")
+        # Tabs
+        self.tabs = QtWidgets.QTabWidget()
+        self.table_tab = ParamTable(dde_client)
+        self.step_tab = StepTestTab(dde_client)
+        self.table_tab.custom_added.connect(self.step_tab.refresh_param_list)
+        self.tabs.addTab(self.table_tab, "Parameters")
+        self.tabs.addTab(self.step_tab, "Step Test")
 
-        self._step_index += 1
-        if self._step_index >= self.num_steps.value():
-            self._timer.stop()
-            self.start_button.setEnabled(True)
+        # Footer warning (always visible)
+        self.footer_warning = make_warning_strip(self)
 
+        v.addWidget(self.tabs)
+        v.addWidget(self.footer_warning)
 
-# =============================================================================
-# Main Window
-# =============================================================================
-class MainWindow(QtWidgets.QTabWidget):
-    """
-    Main application window containing:
-      - ParametersTab (table editor)
-      - StepTestTab   (symbolic step preview + timed apply)
-    """
-
-    def __init__(self, dde_client: SXMRemote.DDEClient, parent: QtWidgets.QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("NC-AFM Control Suite")
-        self.resize(900, 540)
-
-        self.parameters_tab = ParametersTab(dde_client)
-        self.step_test_tab = StepTestTab(dde_client)
-
-        self.addTab(self.parameters_tab, "Parameters")
-        self.addTab(self.step_test_tab, "Step Test")
-
-
-# =============================================================================
-# Entrypoint (production)
-# =============================================================================
-def main() -> int:
-    """
-    Create the Qt application, connect to the SXM DDE server using SXMRemote,
-    and start the GUI.
-
-    Requirements:
-      - The SXM software providing the DDE server ("SXM","Remote") must be running.
-      - SXMRemote.py must be importable (same folder or on PYTHONPATH).
-    """
+# ---------------- Main ----------------
+def main():
     app = QtWidgets.QApplication(sys.argv)
-
-    # Production connection: use the official DDEClient as in your examples
-    dde_client = SXMRemote.DDEClient("SXM", "Remote")
-
-    # (Optional) Match your examples — set combined mode once. Safe if already set.
     try:
-        dde_client.SendWait("FeedPara('Mode', 8);")  # STM + AFM PLL
-    except Exception:
-        pass
-
-    window = MainWindow(dde_client)
-    window.show()
+        import importlib
+        SXMRemote = importlib.import_module("SXMRemote")
+        dde = SXMRemote.DDEClient("SXM", "Remote")
+        print("[INFO] Connected to real DDE server.")
+    except Exception as e:
+        print(f"[INFO] Using mock DDE client: {e}")
+        dde = MockDDEClient()
+    win = MainWindow(dde)
+    win.show()
     return app.exec_()
-
 
 if __name__ == "__main__":
     sys.exit(main())
