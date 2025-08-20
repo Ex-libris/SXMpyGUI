@@ -217,6 +217,26 @@ class ParamTable(QtWidgets.QWidget):
         self.toggle_log_btn.toggled.connect(self.toggle_log)
         toolbar.addWidget(self.toggle_log_btn)
 
+        # ---- New: Tune file workflow ----
+        self.save_tune_btn = QtWidgets.QPushButton("Save Tune…")
+        self.save_tune_btn.clicked.connect(self.save_tune)
+        toolbar.addWidget(self.save_tune_btn)
+
+        self.load_tune_btn = QtWidgets.QPushButton("Load Tune (Preview)…")
+        self.load_tune_btn.clicked.connect(self.load_tune_preview)
+        toolbar.addWidget(self.load_tune_btn)
+
+        self.apply_tune_btn = QtWidgets.QPushButton("Apply Tune Preview")
+        self.apply_tune_btn.setEnabled(False)
+        self.apply_tune_btn.clicked.connect(self.apply_tune_preview)
+        toolbar.addWidget(self.apply_tune_btn)
+
+        self.clear_preview_btn = QtWidgets.QPushButton("Clear Preview")
+        self.clear_preview_btn.setEnabled(False)
+        self.clear_preview_btn.clicked.connect(self.clear_preview)
+        toolbar.addWidget(self.clear_preview_btn)
+        # ---------------------------------
+
         toolbar.addStretch()
 
         self.table = QtWidgets.QTableWidget(0, 5)
@@ -243,6 +263,31 @@ class ParamTable(QtWidgets.QWidget):
 
     def _row_param(self, row):
         return self._all_params_list()[row]
+
+    # ---- New helpers for tune preview/apply ----
+    def _row_lookup_by_code(self):
+        """
+        Map ('EDIT','EditXX') / ('DNC', 'n') -> row index for fast staging.
+        """
+        mapping = {}
+        for row, (key, (ptype, pcode), label) in enumerate(self._all_params_list()):
+            mapping[(ptype, str(pcode))] = row
+        return mapping
+
+    def _collect_params_snapshot(self):
+        """
+        Build a list of {'ptype','pcode','label','value'} using the CURRENT column.
+        """
+        out = []
+        for row, (key, (ptype, pcode), label) in enumerate(self._all_params_list()):
+            cur_txt = self.table.item(row, 3).text()
+            try:
+                cur_val = float(cur_txt) if cur_txt not in ("", "—") else None
+            except Exception:
+                cur_val = None
+            out.append({"ptype": ptype, "pcode": pcode, "label": label, "value": cur_val})
+        return out
+    # -------------------------------------------
 
     def _rebuild_table(self):
         rows = self._all_params_list()
@@ -337,6 +382,138 @@ class ParamTable(QtWidgets.QWidget):
         self._rebuild_table()
         self.custom_added.emit()
 
+    # ---------- New: Tune file workflow ----------
+    def save_tune(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Tune", "ncafm_tune.json", "Tune Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        import json, time
+        payload = {
+            "kind": "ncafm_tune",
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "params": self._collect_params_snapshot(),
+            "note": "Values correspond to the CURRENT column in the ncAFM panel.",
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            QtWidgets.QMessageBox.information(self, "Saved", f"Tune saved to:\n{path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Save Error", str(e))
+
+    def load_tune_preview(self):
+        """
+        Load a tune JSON and populate ONLY the 'New Value' column (no sending).
+        Also highlights staged cells and enables Apply/Clear controls.
+        """
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load Tune (Preview)", "", "Tune Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        import json
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Load Error", f"Failed to read file:\n{e}")
+            return
+
+        if not isinstance(payload, dict) or "params" not in payload:
+            QtWidgets.QMessageBox.warning(self, "Load Error", "Invalid tune file format.")
+            return
+
+        # Don’t auto-send while previewing staged values
+        self.auto_send_chk.setChecked(False)
+
+        lookup = self._row_lookup_by_code()
+        staged = 0
+        for p in payload["params"]:
+            ptype = p.get("ptype")
+            pcode = str(p.get("pcode"))
+            val = p.get("value", None)
+            if not isinstance(val, (int, float)):
+                continue
+            row = lookup.get((ptype, pcode))
+            if row is None:
+                continue
+            # Put into "New Value" column only
+            self.table.item(row, 4).setText(str(val))
+            self.table.item(row, 4).setBackground(QtGui.QColor("#e6ffe6"))  # light green
+            staged += 1
+
+        self.apply_tune_btn.setEnabled(staged > 0)
+        self.clear_preview_btn.setEnabled(staged > 0)
+        if staged == 0:
+            QtWidgets.QMessageBox.information(self, "Nothing Staged", "No matching numeric values found to preview.")
+        else:
+            QtWidgets.QMessageBox.information(
+                self, "Preview Loaded",
+                f"Staged {staged} value(s) in the 'New Value' column.\n"
+                "Review them, then click 'Apply Tune Preview'."
+            )
+
+    def clear_preview(self):
+        """
+        Clear staged values and highlighting from the 'New Value' column.
+        """
+        rows = self.table.rowCount()
+        for row in range(rows):
+            self.table.item(row, 4).setText("")
+            self.table.item(row, 4).setBackground(QtGui.QColor("#fff8dc"))  # back to pale yellow
+        self.apply_tune_btn.setEnabled(False)
+        self.clear_preview_btn.setEnabled(False)
+
+    def apply_tune_preview(self):
+        """
+        Apply only the values currently staged in 'New Value' cells.
+        Shows a single confirmation with a count summary before sending.
+        """
+        # Collect staged numeric values
+        rows_to_apply = []
+        for row in range(self.table.rowCount()):
+            txt = self.table.item(row, 4).text().strip()
+            if txt == "":
+                continue
+            try:
+                v = float(txt)
+            except ValueError:
+                continue
+            rows_to_apply.append((row, v))
+
+        if not rows_to_apply:
+            QtWidgets.QMessageBox.information(self, "Nothing to Apply", "No staged numeric values.")
+            return
+
+        # One overall confirmation before sending
+        reply = QtWidgets.QMessageBox.question(
+            self, "Apply Tune Preview",
+            f"Apply {len(rows_to_apply)} staged value(s) from the 'New Value' column?\n\n"
+            "Safety notes:\n"
+            "• Values are sent as-is, interpreted in the SXM’s current GUI units.\n"
+            f"• Voltage-like channels over ±{VOLTAGE_LIMIT_ABS} V will still prompt individually.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        applied = 0
+        for row, val in rows_to_apply:
+            try:
+                self.apply_row(row, val)  # uses existing guardrails + logging
+                applied += 1
+            except Exception as e:
+                self.log_widget.append(f"[APPLY TUNE] Row {row} failed: {e}")
+
+        # Clear preview highlighting for rows we just applied (keep values visible)
+        for row, _ in rows_to_apply:
+            self.table.item(row, 4).setBackground(QtGui.QColor("#fff8dc"))
+
+        QtWidgets.QMessageBox.information(self, "Tune Applied", f"Applied {applied} value(s).")
+    # ---------- end tune workflow ----------
+
 # ---------------- Tab 2: Step Test (symbolic + send + stop) ----------------
 class StepTestTab(QtWidgets.QWidget):
     def __init__(self, dde_client):
@@ -361,11 +538,16 @@ class StepTestTab(QtWidgets.QWidget):
         ctrl.addWidget(self.param_combo, row, col, 1, 2); col += 2
         low_lbl = QtWidgets.QLabel("Low:"); low_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         ctrl.addWidget(low_lbl, row, col); col += 1
-        self.low_val = QtWidgets.QDoubleSpinBox(); self.low_val.setDecimals(6); self.low_val.setMaximum(1e12); self.low_val.setValue(100.0); self.low_val.setFixedWidth(120)
+        # ---- allow negative values
+        self.low_val = QtWidgets.QDoubleSpinBox(); self.low_val.setDecimals(6)
+        self.low_val.setMinimum(-1e12); self.low_val.setMaximum(1e12)
+        self.low_val.setValue(100.0); self.low_val.setFixedWidth(120)
         ctrl.addWidget(self.low_val, row, col); col += 1
         high_lbl = QtWidgets.QLabel("High:"); high_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         ctrl.addWidget(high_lbl, row, col); col += 1
-        self.high_val = QtWidgets.QDoubleSpinBox(); self.high_val.setDecimals(6); self.high_val.setMaximum(1e12); self.high_val.setValue(101.0); self.high_val.setFixedWidth(120)
+        self.high_val = QtWidgets.QDoubleSpinBox(); self.high_val.setDecimals(6)
+        self.high_val.setMinimum(-1e12); self.high_val.setMaximum(1e12)
+        self.high_val.setValue(101.0); self.high_val.setFixedWidth(120)
         ctrl.addWidget(self.high_val, row, col); col += 1
         per_lbl = QtWidgets.QLabel("Period (s):"); per_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         ctrl.addWidget(per_lbl, row, col); col += 1
