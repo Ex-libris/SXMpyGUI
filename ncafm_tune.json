@@ -1,0 +1,49 @@
+{
+  "kind": "ncafm_tune",
+  "created": "2025-08-19 15:45:34",
+  "params": [
+    {
+      "ptype": "EDIT",
+      "pcode": "Edit24",
+      "label": "Amplitude Ki",
+      "value": 1335.0
+    },
+    {
+      "ptype": "EDIT",
+      "pcode": "Edit32",
+      "label": "Amplitude Kp",
+      "value": 4140.0
+    },
+    {
+      "ptype": "EDIT",
+      "pcode": "Edit27",
+      "label": "PLL Kp",
+      "value": 41414.0
+    },
+    {
+      "ptype": "EDIT",
+      "pcode": "Edit22",
+      "label": "PLL Ki",
+      "value": 9999.0
+    },
+    {
+      "ptype": "EDIT",
+      "pcode": "Edit23",
+      "label": "Amplitude Ref",
+      "value": 18556.0
+    },
+    {
+      "ptype": "DNC",
+      "pcode": 3,
+      "label": "Used Frequency (f0)",
+      "value": 447200000.0
+    },
+    {
+      "ptype": "DNC",
+      "pcode": 4,
+      "label": "Drive",
+      "value": 5741.0
+    }
+  ],
+  "note": "Values are in whatever units SXM expects at load time."
+}
